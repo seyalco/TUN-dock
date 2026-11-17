@@ -7,13 +7,19 @@ Tundock is a native Linux desktop app for running a selected program and its chi
 Open the executable for your architecture from your file manager or run it in a terminal. If the file manager removed the executable permission on download, mark it executable in Properties or use:
 
 ```sh
-chmod +x Tundock-1.1.0-linux-x86_64
-./Tundock-1.1.0-linux-x86_64
+chmod +x Tundock-1.2.0-linux-x86_64
+./Tundock-1.2.0-linux-x86_64
 ```
 
 The bundled-engine build contains Tundock and sing-box in one Linux ELF. It loads them into a private temporary directory and removes that directory when the app exits. It uses no application installer or FUSE. Tundock keeps saved presets and proxy bookmarks in `${XDG_CONFIG_HOME:-$HOME/.config}/tundock`.
 
 Enter a proxy and select **Test connection** to check connectivity and protocol support. Use **Installed apps**, **Browse**, or **Add to list** to prepare programs in the current window. **Start proxy service** enables the list without opening programs. Play buttons start individual private tunnels with the active service settings. **Stop proxy service** closes every session it started. Use **Save preset** to keep a program together with settings across restarts.
+
+### Use VPN Dock as the second proxy
+
+**Stage A** and **Stage B** have separate proxy settings, program lists, and start/stop controls. Configure the upstream proxy A and use **Add VPN Dock** on Stage A to queue the portable VPN Dock executable. Start the A service and use the play button for VPN Dock. Connect the VPN using its own window.
+
+Tundock owns a host-side endpoint on `127.0.0.1:1089` for that VPN Dock launch. In Stage B, select **Use A output**, then start its service and run the consumer apps through their play buttons. The same port accepts SOCKS5 and HTTP CONNECT. A refuses to use its own B endpoint as an upstream. Proxied flows close if the export disappears. For VPNs that need UDP transport, A must support UDP.
 
 ### Run a terminal command
 
@@ -70,7 +76,7 @@ TUNDOCK_SING_BOX=/path/to/sing-box /usr/bin/python3 tests/integration.py
   --engine /path/to/sing-box \
   --engine-license /path/to/sing-box-notices.txt \
   --engine-source https://github.com/SagerNet/sing-box/tree/v1.14.4 \
-  /tmp/Tundock-1.1.0-linux-x86_64
+  /tmp/Tundock-1.2.0-linux-x86_64
 ```
 
 Use the exact license notices and source location for the binary you bundle. `--portable-notices` displays the bundled notice and source reference. The builder writes a companion SHA-256 file. `./packaging/make-release.sh /tmp` produces a source archive.

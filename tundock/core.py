@@ -21,6 +21,7 @@ import time
 from urllib.parse import quote, unquote, urlsplit
 
 from .launchcheck import already_running, delegation, flatpak_target, private_flatpak_args, running_flatpak
+from .proxy_export import ProxyExport
 
 ROOT = Path(__file__).resolve().parent
 DEVICE = "tundock0"
@@ -284,13 +285,14 @@ def engine_version(tools, stop=None):
 class Tunnel:
     """A private network namespace held open by a host-side sing-box process."""
 
-    def __init__(self, proxy, options, *, udp, ipv6, output=None, capture_enabled=None):
+    def __init__(self, proxy, options, *, udp, ipv6, output=None, capture_enabled=None, export=None):
         self.proxy, self.options = proxy, options
         self.udp, self.ipv6 = udp, ipv6
         self.files = ExitStack()
         self.engine = None
         self.app = None
         self.ns_fds = ()
+        self.export = export
         self.output = output
         self.capture_enabled = capture_enabled
         self._readers = []
@@ -352,6 +354,8 @@ class Tunnel:
                     self.files.close()
 
     def start(self, stop=None):
+        if self.export and self.export.feeds(self.proxy):
+            raise TunnelError("Stage A cannot use the host endpoint that its VPN Dock session exports.")
         self.tools = dependency_paths()
         version = engine_version(self.tools, stop)
         self._emit("Network", f"Preparing private TUN with sing-box {version}.")
@@ -481,7 +485,8 @@ class Tunnel:
         return {
             key: value for key, value in os.environ.items()
             if key.lower() not in {"all_proxy", "http_proxy", "https_proxy", "no_proxy", "ftp_proxy"}
-            and key not in {"RES_OPTIONS", "LOCALDOMAIN", "HOSTALIASES"}
+            and key not in {"RES_OPTIONS", "LOCALDOMAIN", "HOSTALIASES",
+                            "VPNDOCK_EXPORT_SOCKET", "VPNDOCK_EXPORT_PORT"}
         }
 
     def run(self, args, *, cwd=None, timeout=10, stop=None):
@@ -505,7 +510,7 @@ class Tunnel:
             if direct:
                 self._emit("Network", "Starting the Flatpak executable directly instead of sending a D-Bus launch request.")
             self._emit("Network", f"Flatpak {app_id} will inherit this session's private network.")
-        elif other := already_running(args, cwd=cwd):
+        elif self.export is None and (other := already_running(args, cwd=cwd)):
             raise TunnelError(f"This program is already running (PID {other}). Close its other windows and retry. "
                               "An existing process keeps its original network.")
         require_active(stop)
@@ -514,6 +519,8 @@ class Tunnel:
         args = [sys.executable, str(ROOT / "app_runner.py"), str(marker), expected, *args]
         capture = not interactive and self.output is not None
         environment = self.environment()
+        if self.export:
+            environment.update(self.export.environment)
         if capture:
             environment.setdefault("PYTHONUNBUFFERED", "1")
         self.app = subprocess.Popen(

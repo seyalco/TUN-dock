@@ -1,7 +1,9 @@
 """Native GTK desktop interface."""
 
 from collections import deque
+from contextlib import ExitStack
 from dataclasses import dataclass
+import ipaddress
 import os
 from pathlib import Path
 import re
@@ -20,7 +22,7 @@ from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango
 
 from . import __version__, storage
 from .core import (
-    ROOT, POLICIES, RESOLVERS, Options, Proxy, Report, Tunnel, TunnelError,
+    ROOT, POLICIES, RESOLVERS, Options, Proxy, ProxyExport, Report, Tunnel, TunnelError,
     app_command, dependency_paths, network_modes,
 )
 from .diagnostics import probe
@@ -28,6 +30,9 @@ from .launchcheck import flatpak_target, launch_target
 
 APP_ID = "io.github.tundock.Tundock"
 PROBE_HINT = "The test contacts Cloudflare and the selected encrypted DNS resolver through the proxy."
+VPN_PROXY_PORT = 1089
+VPN_PROXY_ADDRESS = f"socks5://127.0.0.1:{VPN_PROXY_PORT}"
+VPN_DOCK = (Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "vpndock/VPN-Dock")
 
 
 def label(title, *styles, wrap=False):
@@ -167,6 +172,7 @@ class Session:
     network: Gtk.Label
     tunnel: Tunnel | None = None
     checking: bool = False
+    upstream: Proxy | None = None
 
 
 @dataclass
@@ -178,18 +184,20 @@ class ProgramEntry:
     row: Adw.ActionRow
     play: Gtk.Button
     session_id: int | None = None
+    exports_vpn: bool = False
 
 
 class Window(Adw.ApplicationWindow):
-    def __init__(self, app):
-        super().__init__(application=app, title="Tundock", default_width=1090, default_height=795)
+    def __init__(self, app, page="A"):
+        super().__init__(application=app, title=f"Tundock · {page}", default_width=1090, default_height=795)
+        self.page = page
         self.set_size_request(760, 560)
         self.add_css_class("tundock")
         self.report = None
         self.report_key = None
         self.test_stop = None
+        self.test_target = None
         self.closing = False
-        self.close_dialog = None
         self.sessions = {}
         self.next_session = 0
         self.programs = []
@@ -224,6 +232,14 @@ class Window(Adw.ApplicationWindow):
         brand_icon = self._brand_picture(24)
         brand_icon.add_css_class("brand-icon")
         header.set_title_widget(box(brand_icon, label("Tundock", "wordmark"), spacing=8))
+        navigation = box()
+        navigation.add_css_class("linked")
+        for name, text in (("A", "A · VPN upstream"), ("B", "B · Apps")):
+            control = button(text, lambda _, destination=name: app.show_page(destination))
+            if name == page:
+                control.add_css_class("suggested-action")
+            navigation.append(control)
+        header.pack_start(navigation)
 
         self.preset_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.preset_list.add_css_class("presets")
@@ -239,6 +255,8 @@ class Window(Adw.ApplicationWindow):
 
         self.proxy = entry("socks5://127.0.0.1:8083")
         self.proxy.add_css_class("mono")
+        if self.page == "B":
+            self.proxy.set_text(app.vpn_address)
         self.username = entry("Username")
         self.password = entry("Password", secret=True)
         self.command = entry("Executable path or command with arguments")
@@ -250,9 +268,14 @@ class Window(Adw.ApplicationWindow):
         self.desktop = Gtk.Switch(valign=Gtk.Align.CENTER)
         self.test = button("Test connection", self._test, "test-button", icon="view-refresh-symbolic")
 
-        heading = box(label("Launch an isolated app", "headline", wrap=True),
-                      label("Choose a proxy and a program. Other apps keep their current connection.",
-                            "subheading", wrap=True), vertical=True, spacing=7)
+        if self.page == "A":
+            page_title = "VPN upstream"
+            page_hint = "Select an upstream proxy and launch VPN Dock here. Its local output feeds page B."
+        else:
+            page_title = "Isolated applications"
+            page_hint = "Use VPN Dock’s output as the proxy for the programs on this page."
+        heading = box(label(page_title, "headline", wrap=True), label(page_hint, "subheading", wrap=True),
+                      vertical=True, spacing=7)
         heading.set_hexpand(True)
         hero_icon = self._brand_picture(64)
         hero_icon.set_valign(Gtk.Align.CENTER)
@@ -277,6 +300,11 @@ class Window(Adw.ApplicationWindow):
         proxy_card = box(box(proxy_title, self.test, spacing=12), self.proxy,
                          box(proxy_hint, self.bookmark_menu, save_proxy, spacing=8),
                          vertical=True, spacing=9)
+        if self.page == "B":
+            self.export_notice = label("Waiting for VPN Dock on A.", "field-hint", wrap=True)
+            self.export_notice.set_hexpand(True)
+            self.use_export = button("Use A output", self._apply_vpn_output, "small-button")
+            proxy_card.append(box(self.export_notice, self.use_export, spacing=8))
         proxy_card.add_css_class("card")
 
         self.metrics = {}
@@ -316,10 +344,16 @@ class Window(Adw.ApplicationWindow):
         self.program_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.program_list.add_css_class("boxed-list")
         self.program_list.set_visible(False)
-        app_card = box(label("Programs", "section-title"), self.command,
-                       box(pick, browse, commands, add, spacing=8), self.program_list,
-                       label("Start the service, then use a program’s play button. Quit any existing copy first.",
-                             "field-hint", wrap=True), vertical=True, spacing=9)
+        app_card = box(label("Programs", "section-title"), self.command, box(pick, browse, commands, add, spacing=8),
+                       vertical=True, spacing=9)
+        if self.page == "A":
+            self.export_notice = label("Add VPN Dock to provide the proxy on page B.", "field-hint", wrap=True)
+            self.export_notice.set_hexpand(True)
+            add_vpn = button("Add VPN Dock…", self._add_vpn_dock, "small-button", icon="list-add-symbolic")
+            app_card.append(box(self.export_notice, add_vpn, spacing=8))
+        app_card.append(self.program_list)
+        app_card.append(label("Start the service, then use a program’s play button. Quit any existing copy first.",
+                              "field-hint", wrap=True))
         app_card.add_css_class("card")
 
         advanced = Adw.ExpanderRow(title="Connection options", subtitle="Credentials, DNS and desktop integration")
@@ -383,6 +417,7 @@ class Window(Adw.ApplicationWindow):
         self.desktop.connect("notify::active", self._settings_changed)
         if self.preset_error:
             GLib.idle_add(self._toast, self.preset_error)
+        self._refresh_vpn_output()
 
     @staticmethod
     def _brand_picture(size):
@@ -408,6 +443,39 @@ class Window(Adw.ApplicationWindow):
             self.username.set_text(proxy.username)
             self.password.set_text(proxy.password)
         return proxy, options
+
+    def _apply_vpn_output(self, *_):
+        self.username.set_text("")
+        self.password.set_text("")
+        self.proxy.set_text(self.get_application().vpn_address)
+
+    def _refresh_vpn_output(self, previous_address=None):
+        app = self.get_application()
+        if self.page == "B" and previous_address is not None:
+            if self.proxy.get_text() == previous_address and previous_address != app.vpn_address:
+                self._apply_vpn_output()
+        if app.vpn_ready:
+            port = Proxy.parse(app.vpn_address).port
+            self.export_notice.set_text(
+                f"VPN Dock output · {app.vpn_address} · http://127.0.0.1:{port}"
+            )
+        elif app.vpn_export is not None:
+            self.export_notice.set_text("Open your VPN in VPN Dock on A. Its output activates when its tunnel is ready.")
+        elif self.page == "A":
+            self.export_notice.set_text("Add VPN Dock to provide the proxy on page B.")
+        else:
+            self.export_notice.set_text("Waiting for VPN Dock on A.")
+
+    def _validate_page_proxy(self, proxy):
+        app = self.get_application()
+        if not app.matches_vpn_output(proxy):
+            return
+        if self.page == "A":
+            if app.vpn_export is not None or any(item.exports_vpn for item in self.programs):
+                raise TunnelError("Use a different upstream on A. Its managed VPN Dock output belongs on B.")
+            return
+        if not app.vpn_ready:
+            raise TunnelError("Start VPN Dock and bring up its VPN on A before using its output on B.")
 
     def _render_bookmarks(self):
         clear_list(self.bookmark_list)
@@ -483,8 +551,7 @@ class Window(Adw.ApplicationWindow):
         except OSError as error:
             self._toast(f"Couldn't save proxy bookmarks. {error.strerror}")
             return False
-        self.bookmarks = bookmarks
-        self._render_bookmarks()
+        self.get_application()._sync_bookmarks(bookmarks)
         return True
 
     def _update_report(self, report):
@@ -556,12 +623,14 @@ class Window(Adw.ApplicationWindow):
             return
         try:
             key = self._input()
+            self._validate_page_proxy(key[0])
             dependency_paths()
         except TunnelError as error:
             self._toast(error)
             return
         stop = threading.Event()
         self.test_stop = stop
+        self.test_target = key[0]
         self.report = self.report_key = None
         self._update_report(Report())
         self.test.get_child().set_label("Cancel test")
@@ -583,6 +652,7 @@ class Window(Adw.ApplicationWindow):
         if self.test_stop is not stop:
             return False
         self.test_stop = None
+        self.test_target = None
         if self.closing:
             self._complete_close()
             return False
@@ -610,19 +680,25 @@ class Window(Adw.ApplicationWindow):
         if self.closing or self.stopping_service:
             return
         if self.service is not None:
-            self.service = None
-            self.stopping_service = bool(self.sessions)
-            for session_id in self.sessions:
-                self._stop_session(session_id)
+            self._stop_service()
+            return
         else:
             try:
                 proxy, options = self._input()
+                self._validate_page_proxy(proxy)
                 dependency_paths()
             except (TunnelError, OSError) as error:
                 self._toast(error)
                 return
             report = self.report if self.report_key == (proxy, options) else Report()
             self.service = (proxy, options, *network_modes(proxy, options, report))
+        self._refresh_service()
+
+    def _stop_service(self):
+        self.service = None
+        self.stopping_service = bool(self.sessions)
+        for session_id in self.sessions:
+            self._stop_session(session_id)
         self._refresh_service()
 
     def _refresh_service(self):
@@ -641,8 +717,36 @@ class Window(Adw.ApplicationWindow):
             self.service_status.set_text("Proxy service off")
         self.launch_button.set_sensitive(not self.stopping_service)
         self._update_protocol_plan(self.report if self.report is not None else Report())
+        export_running = any(item.exports_vpn and item.session_id is not None for item in self.programs)
         for item in self.programs:
-            item.play.set_sensitive(self.service is not None and item.session_id is None)
+            can_launch = self.service is not None and item.session_id is None
+            item.play.set_sensitive(can_launch and (not item.exports_vpn or not export_running))
+
+    def _add_vpn_dock(self, *_):
+        if VPN_DOCK.is_file() and os.access(VPN_DOCK, os.X_OK):
+            self._queue_vpn_dock(VPN_DOCK)
+            return
+        dialog = Gtk.FileChooserNative(
+            title="Choose the VPN Dock executable", transient_for=self,
+            action=Gtk.FileChooserAction.OPEN, accept_label="Add VPN Dock", cancel_label="Cancel",
+        )
+
+        def respond(chooser, response):
+            if response == Gtk.ResponseType.ACCEPT and (file := chooser.get_file()):
+                if path := file.get_path():
+                    self._queue_vpn_dock(path)
+            chooser.destroy()
+
+        dialog.connect("response", respond)
+        dialog.show()
+
+    def _queue_vpn_dock(self, path):
+        try:
+            args, directory = app_command(shlex.quote(str(path)), self.folder.get_text())
+        except (TunnelError, OSError) as error:
+            self._toast(error)
+            return
+        self._queue_program(args, directory, "VPN Dock", exports_vpn=True)
 
     def _queue_from_form(self, *_, display_name=None):
         try:
@@ -655,11 +759,17 @@ class Window(Adw.ApplicationWindow):
         name = display_name or (flatpak[1] if flatpak else Path(target[0]).name)
         return self._queue_program(args, directory, name)
 
-    def _queue_program(self, args, directory, name, *, terminal=False):
-        existing = next((item for item in self.programs if item.args == args and item.directory == directory), None)
+    def _queue_program(self, args, directory, name, *, terminal=False, exports_vpn=False):
+        existing = next((item for item in self.programs
+                         if item.args == args and item.directory == directory and item.exports_vpn == exports_vpn), None)
         if existing:
             return existing
-        detail = "Shell command · output appears in Sessions" if terminal else str(directory)
+        if exports_vpn:
+            detail = "Provides the local proxy for page B"
+        elif terminal:
+            detail = "Shell command · output appears in Sessions"
+        else:
+            detail = str(directory)
         row = Adw.ActionRow(title=GLib.markup_escape_text(name), subtitle=GLib.markup_escape_text(detail))
         play = Gtk.Button.new_from_icon_name("media-playback-start-symbolic")
         play.set_tooltip_text(f"Run {name} in the proxy service")
@@ -668,7 +778,7 @@ class Window(Adw.ApplicationWindow):
         remove.set_tooltip_text(f"Remove {name} from the list")
         remove.set_valign(Gtk.Align.CENTER)
         remove.add_css_class("flat")
-        item = ProgramEntry(args, directory, name, terminal, row, play)
+        item = ProgramEntry(args, directory, name, terminal, row, play, exports_vpn=exports_vpn)
         play.connect("clicked", lambda *_: self._launch(item))
         remove.connect("clicked", lambda *_: self._remove_program(item))
         row.add_suffix(play)
@@ -726,6 +836,15 @@ class Window(Adw.ApplicationWindow):
         if self.closing or self.service is None or item.session_id is not None:
             return
         proxy, options, udp, ipv6 = self.service
+        try:
+            self._validate_page_proxy(proxy)
+        except TunnelError as error:
+            self._toast(error)
+            return
+        if item.exports_vpn and any(other.exports_vpn and other.session_id is not None for other in self.programs):
+            self._toast("VPN Dock is already running on A.")
+            return
+        app = self.get_application()
         args, directory, name = item.args, item.directory, item.name
         self.next_session += 1
         session_id = self.next_session
@@ -734,6 +853,7 @@ class Window(Adw.ApplicationWindow):
         self._refresh_service()
         mode = f"{proxy.address}  ·  UDP {'on' if udp else 'blocked'}  ·  IPv6 {'on' if ipv6 else 'blocked'}"
         session = self._create_session(session_id, name)
+        session.upstream = proxy
         self.sessions[session_id] = session
         self.session_list.prepend(session.row)
         self.session_list.set_visible(True)
@@ -749,10 +869,16 @@ class Window(Adw.ApplicationWindow):
             failed = False
             launched = False
             try:
-                with Tunnel(
-                    proxy, options, udp=udp, ipv6=ipv6,
-                    output=session.log.append, capture_enabled=session.log.is_enabled,
-                ) as tunnel:
+                with ExitStack() as resources:
+                    export = None
+                    if item.exports_vpn:
+                        export = resources.enter_context(ProxyExport(port=VPN_PROXY_PORT))
+                        GLib.idle_add(app._register_vpn_export, self, session_id, export)
+                        resources.callback(app._drain_vpn_export, self, session_id, export)
+                    tunnel = resources.enter_context(Tunnel(
+                        proxy, options, udp=udp, ipv6=ipv6,
+                        output=session.log.append, capture_enabled=session.log.is_enabled, export=export,
+                    ))
                     tunnel.start(session.stop)
                     if session.stop.is_set():
                         raise InterruptedError("Session cancelled.")
@@ -881,6 +1007,22 @@ class Window(Adw.ApplicationWindow):
             session.button.set_sensitive(False)
             session.check_button.set_sensitive(False)
             session.row.set_subtitle("Stopping…")
+
+    def _stop_consuming_vpn_output(self):
+        app = self.get_application()
+        test = self.test_stop if self.test_target is not None and app.matches_vpn_output(self.test_target) else None
+        if test is not None:
+            self._cancel_test()
+        sessions = [session_id for session_id, session in self.sessions.items()
+                    if session.upstream is not None and app.matches_vpn_output(session.upstream)]
+        if self.service is not None and app.matches_vpn_output(self.service[0]):
+            self._stop_service()
+            if not self.closing:
+                self._toast("VPN Dock’s output ended. Stopping the dependent proxy service on B.")
+        else:
+            for session_id in sessions:
+                self._stop_session(session_id)
+        return sessions, test
 
     def _finished(self, session_id, status, failed):
         if session := self.sessions.pop(session_id, None):
@@ -1075,38 +1217,11 @@ class Window(Adw.ApplicationWindow):
         except OSError as error:
             self._toast(f"Couldn't save presets: {error.strerror}")
             return False
-        self.presets = presets
-        self._render_presets()
+        self.get_application()._sync_presets(presets)
         return True
 
     def _close_requested(self, *_):
-        if self.closing:
-            return True
-        if not self.sessions:
-            if self.test_stop:
-                self._begin_close()
-                return True
-            return False
-        if self.close_dialog:
-            self.close_dialog.present()
-            return True
-        dialog = Adw.MessageDialog(transient_for=self, heading="Close isolated sessions?",
-                                   body="Closing Tundock will stop the programs it launched.")
-        dialog.add_response("cancel", "Keep open")
-        dialog.add_response("stop", "Stop and close")
-        dialog.set_response_appearance("stop", Adw.ResponseAppearance.DESTRUCTIVE)
-        dialog.set_default_response("cancel")
-        dialog.set_close_response("cancel")
-
-        def respond(_, response):
-            self.close_dialog = None
-            if response == "stop":
-                self._begin_close()
-
-        self.close_dialog = dialog
-        dialog.connect("response", respond)
-        dialog.present()
-        return True
+        return self.get_application()._request_close(self)
 
     def _begin_close(self):
         self.closing = True
@@ -1118,6 +1233,7 @@ class Window(Adw.ApplicationWindow):
 
     def _complete_close(self):
         if self.closing and not self.sessions and self.test_stop is None:
+            self.get_application()._page_finished(self)
             self.destroy()
 
 
@@ -1127,6 +1243,14 @@ class Application(Adw.Application):
         version = re.sub(r"[^A-Za-z0-9_]", "_", __version__)
         app_id = f"{APP_ID}.Portable.v{version}" if self.portable else APP_ID
         super().__init__(application_id=app_id)
+        self.pages = {}
+        self.active_page = "A"
+        self.closing = False
+        self.close_dialog = None
+        self.vpn_export = None
+        self.vpn_address = VPN_PROXY_ADDRESS
+        self.vpn_ready = False
+        self._export_draining = False
         logging_action = Gio.SimpleAction.new_stateful("session-logging", None, GLib.Variant.new_boolean(True))
         logging_action.connect("change-state", self._change_session_logging)
         self.add_action(logging_action)
@@ -1134,6 +1258,100 @@ class Application(Adw.Application):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", callback)
             self.add_action(action)
+
+    def show_page(self, page):
+        if self.closing:
+            return
+        previous = self.pages.get(self.active_page)
+        if page not in self.pages:
+            self.pages[page] = Window(self, page)
+        window = self.pages[page]
+        self.active_page = page
+        window.present()
+        if previous is not None and previous is not window:
+            previous.set_visible(False)
+
+    def _sync_presets(self, presets):
+        for window in self.get_windows():
+            if isinstance(window, Window):
+                window.presets = presets
+                if not any(preset.name == window.selected_preset for preset in presets):
+                    window.selected_preset = None
+                window._render_presets()
+
+    def _sync_bookmarks(self, bookmarks):
+        for window in self.get_windows():
+            if isinstance(window, Window):
+                window.bookmarks = bookmarks
+                window._render_bookmarks()
+
+    def matches_vpn_output(self, proxy):
+        if proxy.port not in {VPN_PROXY_PORT, Proxy.parse(self.vpn_address).port}:
+            return False
+        try:
+            address = ipaddress.ip_address(proxy.host)
+        except ValueError:
+            return proxy.host.rstrip(".").casefold() in {"localhost", "localhost.localdomain", "ip6-localhost"}
+        mapped = getattr(address, "ipv4_mapped", None)
+        if mapped is not None:
+            address = mapped
+        return address.is_loopback or address.is_unspecified
+
+    def _register_vpn_export(self, owner, session_id, export):
+        if session_id not in owner.sessions:
+            return GLib.SOURCE_REMOVE
+        previous_address = self.vpn_address
+        self.vpn_address = export.address
+        self.vpn_export = export
+        self.vpn_ready = bool(export.ready)
+        self._export_draining = False
+        self._notify_vpn_output(previous_address)
+        GLib.timeout_add(220, self._watch_vpn_export, export)
+        return GLib.SOURCE_REMOVE
+
+    def _notify_vpn_output(self, previous_address=None):
+        for window in self.pages.values():
+            window._refresh_vpn_output(previous_address)
+
+    def _watch_vpn_export(self, export):
+        if self.vpn_export is not export or self._export_draining:
+            return GLib.SOURCE_REMOVE
+        ready = bool(export.ready)
+        if ready != self.vpn_ready:
+            self.vpn_ready = ready
+            self._notify_vpn_output()
+            if not ready and (consumer := self.pages.get("B")):
+                consumer._stop_consuming_vpn_output()
+        return GLib.SOURCE_CONTINUE
+
+    def _drain_vpn_export(self, owner, session_id, export):
+        # Hold the listening port while GTK stops any B clients still using it.
+        drained = threading.Event()
+        GLib.idle_add(self._begin_vpn_drain, owner, session_id, export, drained)
+        drained.wait()
+
+    def _begin_vpn_drain(self, owner, session_id, export, drained):
+        if self.vpn_export is not export or session_id not in owner.sessions:
+            drained.set()
+            return GLib.SOURCE_REMOVE
+        self._export_draining = True
+        self.vpn_ready = False
+        consumer = self.pages.get("B")
+        sessions, test = consumer._stop_consuming_vpn_output() if consumer else ([], None)
+        self._notify_vpn_output()
+
+        def finish():
+            if consumer is not None and (any(session_id in consumer.sessions for session_id in sessions)
+                                         or (test is not None and consumer.test_stop is test)):
+                return GLib.SOURCE_CONTINUE
+            self.vpn_export = None
+            self._notify_vpn_output()
+            drained.set()
+            return GLib.SOURCE_REMOVE
+
+        if finish() == GLib.SOURCE_CONTINUE:
+            GLib.timeout_add(60, finish)
+        return GLib.SOURCE_REMOVE
 
     def session_logging_enabled(self):
         return self.lookup_action("session-logging").get_state().get_boolean()
@@ -1157,18 +1375,52 @@ class Application(Adw.Application):
         for termination_signal in (signal.SIGTERM, signal.SIGINT):
             GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, termination_signal, self._shutdown_requested)
 
+    def _request_close(self, requester):
+        if self.closing:
+            return True
+        if not any(window.sessions or window.test_stop for window in self.pages.values()):
+            self._shutdown_requested()
+            return True
+        if self.close_dialog:
+            self.close_dialog.present()
+            return True
+        dialog = Adw.MessageDialog(
+            transient_for=requester, heading="Close isolated sessions?",
+            body="Closing Tundock stops the programs and tests on both pages.",
+        )
+        dialog.add_response("cancel", "Keep open")
+        dialog.add_response("stop", "Stop and close")
+        dialog.set_response_appearance("stop", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+
+        def respond(_, response):
+            self.close_dialog = None
+            if response == "stop":
+                self._shutdown_requested()
+
+        self.close_dialog = dialog
+        dialog.connect("response", respond)
+        dialog.present()
+        return True
+
+    def _page_finished(self, window):
+        if self.pages.get(window.page) is window:
+            del self.pages[window.page]
+
     def _shutdown_requested(self):
-        window = self.get_active_window()
-        if isinstance(window, Window):
-            if not window.closing:
+        if self.closing:
+            return GLib.SOURCE_CONTINUE
+        self.closing = True
+        if self.pages:
+            for window in list(self.pages.values()):
                 window._begin_close()
         else:
             self.quit()
         return GLib.SOURCE_CONTINUE
 
     def do_activate(self):
-        window = self.get_active_window() or Window(self)
-        window.present()
+        self.show_page(self.active_page)
 
     def requirements(self, *_):
         try:
