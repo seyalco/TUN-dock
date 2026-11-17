@@ -62,6 +62,26 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(private_flatpak_args(direct, direct[3], 3),
                          ([*direct[:3], "--share=network", direct[3]], False))
 
+    def test_paused_capture_discards_diagnostic_and_app_output(self):
+        from collections import deque
+        from io import BytesIO
+
+        output = []
+        tail = deque()
+        enabled = False
+        proxy = Proxy.parse("127.0.0.1:8083")
+        tunnel = Tunnel(proxy, Options(), udp=False, ipv6=False,
+                        output=lambda source, line: output.append((source, line)),
+                        capture_enabled=lambda: enabled)
+        tunnel._emit("Network", "paused diagnostic")
+        tunnel._drain(BytesIO(b"paused app output\n"), "App", tail).join()
+        self.assertFalse(output)
+        self.assertFalse(tail)
+        enabled = True
+        tunnel._drain(BytesIO(b"visible app output\n"), "App", tail).join()
+        self.assertEqual(output, [("App", "visible app output")])
+        self.assertEqual(list(tail), ["visible app output"])
+
     def test_session_stream_hides_proxy_credentials_and_terminal_escapes(self):
         proxy = Proxy.parse("socks5://example-user:s%3Dsecret@127.0.0.1:8083")
         tunnel = Tunnel(proxy, Options(), udp=False, ipv6=False)

@@ -284,7 +284,7 @@ def engine_version(tools, stop=None):
 class Tunnel:
     """A private network namespace held open by a host-side sing-box process."""
 
-    def __init__(self, proxy, options, *, udp, ipv6, output=None):
+    def __init__(self, proxy, options, *, udp, ipv6, output=None, capture_enabled=None):
         self.proxy, self.options = proxy, options
         self.udp, self.ipv6 = udp, ipv6
         self.files = ExitStack()
@@ -292,13 +292,17 @@ class Tunnel:
         self.app = None
         self.ns_fds = ()
         self.output = output
+        self.capture_enabled = capture_enabled
         self._readers = []
         self._engine_tail = deque(maxlen=12)
         self._app_tail = deque(maxlen=8)
         self._exit_check_lock = threading.Lock()
 
+    def _capture_allowed(self):
+        return self.capture_enabled is None or self.capture_enabled()
+
     def _emit(self, source, line):
-        if self.output:
+        if self.output and self._capture_allowed():
             self.output(source, line)
 
     def _safe_line(self, data):
@@ -319,8 +323,10 @@ class Tunnel:
         def read():
             with pipe:
                 while data := pipe.readline(4096):
+                    if not self._capture_allowed():
+                        continue
                     line = self._safe_line(data)
-                    if line:
+                    if line and self._capture_allowed():
                         if tail is not None:
                             tail.append(line)
                         self._emit(source, line)

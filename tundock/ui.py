@@ -96,7 +96,8 @@ class SessionLog:
     max_lines = 500
     max_columns = 2048
 
-    def __init__(self):
+    def __init__(self, *, enabled=True):
+        self._enabled = enabled
         self.buffer = Gtk.TextBuffer()
         self.view = Gtk.TextView(
             buffer=self.buffer, editable=False, cursor_visible=False,
@@ -112,11 +113,21 @@ class SessionLog:
         self.lock = threading.Lock()
         self.flush_source = 0
 
-    def append(self, source, line):
-        text = f"[{source}] {line.rstrip()}".replace("\r", " ").replace("\n", " ").replace("\0", "�")
-        if len(text) > self.max_columns:
-            text = text[:self.max_columns - 1] + "…"
+    def is_enabled(self):
         with self.lock:
+            return self._enabled
+
+    def set_enabled(self, enabled):
+        with self.lock:
+            self._enabled = enabled
+
+    def append(self, source, line):
+        with self.lock:
+            if not self._enabled:
+                return
+            text = f"[{source}] {line.rstrip()}".replace("\r", " ").replace("\n", " ").replace("\0", "�")
+            if len(text) > self.max_columns:
+                text = text[:self.max_columns - 1] + "…"
             self.pending.append(text)
             if not self.flush_source:
                 self.flush_source = GLib.timeout_add(75, self.flush)
@@ -158,6 +169,17 @@ class Session:
     checking: bool = False
 
 
+@dataclass
+class ProgramEntry:
+    args: list[str]
+    directory: Path
+    name: str
+    terminal: bool
+    row: Adw.ActionRow
+    play: Gtk.Button
+    session_id: int | None = None
+
+
 class Window(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Tundock", default_width=1090, default_height=795)
@@ -170,6 +192,10 @@ class Window(Adw.ApplicationWindow):
         self.close_dialog = None
         self.sessions = {}
         self.next_session = 0
+        self.programs = []
+        self.session_programs = {}
+        self.service = None
+        self.stopping_service = False
         self.selected_preset = None
         self.preset_error = None
         try:
@@ -190,6 +216,7 @@ class Window(Adw.ApplicationWindow):
         header = Adw.HeaderBar()
         header.add_css_class("topbar")
         menu = Gio.Menu()
+        menu.append("Capture session logs", "app.session-logging")
         menu.append("Requirements", "app.requirements")
         menu.append("About Tundock", "app.about")
         header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu,
@@ -284,10 +311,15 @@ class Window(Adw.ApplicationWindow):
 
         browse = button("Browse", self._browse, "small-button")
         pick = button("Installed apps", self._choose_application, "small-button")
-        app_card = box(label("Program", "section-title"), self.command,
-                       box(pick, browse, spacing=8),
-                       label("Close an existing copy before launching a single-instance app.", "field-hint", wrap=True),
-                       vertical=True, spacing=9)
+        commands = button("Terminal command…", self._command_dialog, "small-button")
+        add = button("Add to list", self._queue_from_form, "small-button")
+        self.program_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.program_list.add_css_class("boxed-list")
+        self.program_list.set_visible(False)
+        app_card = box(label("Programs", "section-title"), self.command,
+                       box(pick, browse, commands, add, spacing=8), self.program_list,
+                       label("Start the service, then use a program’s play button. Quit any existing copy first.",
+                             "field-hint", wrap=True), vertical=True, spacing=9)
         app_card.add_css_class("card")
 
         advanced = Adw.ExpanderRow(title="Connection options", subtitle="Credentials, DNS and desktop integration")
@@ -312,12 +344,15 @@ class Window(Adw.ApplicationWindow):
         advanced_group.append(advanced)
 
         save = button("Save preset", self._save_preset, icon="bookmark-new-symbolic")
-        launch = button("Launch isolated", self._launch, "launch-button", icon="media-playback-start-symbolic")
+        self.service_status = label("Proxy service off", "field-hint", wrap=True)
+        self.launch_button = button("Start proxy service", self._toggle_service, "launch-button",
+                                    icon="media-playback-start-symbolic")
         self.latest_session_button = button(
             "Latest log", self._view_latest_session, icon="utilities-terminal-symbolic",
         )
         self.latest_session_button.set_visible(False)
-        actions = box(self.latest_session_button, Gtk.Box(hexpand=True), save, launch, spacing=9)
+        actions = box(self.latest_session_button, self.service_status, Gtk.Box(hexpand=True), save,
+                      self.launch_button, spacing=9)
         footer = Adw.Clamp(maximum_size=965, tightening_threshold=785, child=actions)
         footer.add_css_class("action-bar")
 
@@ -470,6 +505,14 @@ class Window(Adw.ApplicationWindow):
         self._update_protocol_plan(report)
 
     def _update_protocol_plan(self, report):
+        if self.service is not None:
+            _, _, udp, ipv6 = self.service
+            self.protocol_plan.set_text(
+                f"Active service · UDP {'on' if udp else 'off'} · IPv6 {'on' if ipv6 else 'off'} "
+                "· Setting changes apply when you restart the service."
+            )
+            self.protocol_plan.set_visible(True)
+            return
         try:
             proxy, options = self._configuration()
         except TunnelError:
@@ -563,23 +606,132 @@ class Window(Adw.ApplicationWindow):
             self._update_report(result)
         return False
 
-    def _launch(self, *_):
-        if self.closing:
+    def _toggle_service(self, *_):
+        if self.closing or self.stopping_service:
             return
+        if self.service is not None:
+            self.service = None
+            self.stopping_service = bool(self.sessions)
+            for session_id in self.sessions:
+                self._stop_session(session_id)
+        else:
+            try:
+                proxy, options = self._input()
+                dependency_paths()
+            except (TunnelError, OSError) as error:
+                self._toast(error)
+                return
+            report = self.report if self.report_key == (proxy, options) else Report()
+            self.service = (proxy, options, *network_modes(proxy, options, report))
+        self._refresh_service()
+
+    def _refresh_service(self):
+        state = self.launch_button.get_child()
+        if self.stopping_service:
+            state.set_label("Stopping sessions…")
+            state.set_icon_name("process-stop-symbolic")
+            self.service_status.set_text("Closing private tunnels…")
+        elif self.service is not None:
+            state.set_label("Stop proxy service")
+            state.set_icon_name("process-stop-symbolic")
+            self.service_status.set_text(f"Ready · {self.service[0].address}")
+        else:
+            state.set_label("Start proxy service")
+            state.set_icon_name("media-playback-start-symbolic")
+            self.service_status.set_text("Proxy service off")
+        self.launch_button.set_sensitive(not self.stopping_service)
+        self._update_protocol_plan(self.report if self.report is not None else Report())
+        for item in self.programs:
+            item.play.set_sensitive(self.service is not None and item.session_id is None)
+
+    def _queue_from_form(self, *_, display_name=None):
         try:
-            proxy, options = self._input()
             args, directory = app_command(self.command.get_text(), self.folder.get_text())
             flatpak = flatpak_target(args)
-            dependency_paths()
         except (TunnelError, OSError, ValueError) as error:
             self._toast(error)
+            return None
+        target = launch_target(args) or args
+        name = display_name or (flatpak[1] if flatpak else Path(target[0]).name)
+        return self._queue_program(args, directory, name)
+
+    def _queue_program(self, args, directory, name, *, terminal=False):
+        existing = next((item for item in self.programs if item.args == args and item.directory == directory), None)
+        if existing:
+            return existing
+        detail = "Shell command · output appears in Sessions" if terminal else str(directory)
+        row = Adw.ActionRow(title=GLib.markup_escape_text(name), subtitle=GLib.markup_escape_text(detail))
+        play = Gtk.Button.new_from_icon_name("media-playback-start-symbolic")
+        play.set_tooltip_text(f"Run {name} in the proxy service")
+        play.set_valign(Gtk.Align.CENTER)
+        remove = Gtk.Button.new_from_icon_name("edit-delete-symbolic")
+        remove.set_tooltip_text(f"Remove {name} from the list")
+        remove.set_valign(Gtk.Align.CENTER)
+        remove.add_css_class("flat")
+        item = ProgramEntry(args, directory, name, terminal, row, play)
+        play.connect("clicked", lambda *_: self._launch(item))
+        remove.connect("clicked", lambda *_: self._remove_program(item))
+        row.add_suffix(play)
+        row.add_suffix(remove)
+        self.programs.append(item)
+        self.program_list.append(row)
+        self.program_list.set_visible(True)
+        self._refresh_service()
+        return item
+
+    def _remove_program(self, item):
+        if item.session_id is not None:
+            self._toast("Stop this program before removing it.")
             return
-        report = self.report if self.report_key == (proxy, options) else Report()
-        udp, ipv6 = network_modes(proxy, options, report)
+        self.programs.remove(item)
+        self.program_list.remove(item.row)
+        self.program_list.set_visible(bool(self.programs))
+
+    def _command_dialog(self, *_):
+        running = self.service is not None
+        dialog = Adw.MessageDialog(transient_for=self, heading="Terminal command",
+                                   body="Run a noninteractive shell command inside a private tunnel. "
+                                        "Its output appears under Sessions when logging is enabled.")
+        command = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, monospace=True)
+        command.set_tooltip_text("Type a shell command")
+        scroll = Gtk.ScrolledWindow(child=command, min_content_height=94, min_content_width=280)
+        dialog.set_extra_child(scroll)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("run", "Run command" if running else "Add to list")
+        dialog.set_response_appearance("run", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_close_response("cancel")
+
+        def respond(_, response):
+            if response != "run":
+                return
+            buffer = command.get_buffer()
+            value = buffer.get_text(*buffer.get_bounds(), False).strip()
+            if not value:
+                self._toast("Enter a shell command.")
+                return
+            try:
+                args, directory = app_command(shlex.join(["env", "BASH_ENV=/dev/null", "bash", "--noprofile", "--norc", "-c", value]),
+                                              self.folder.get_text())
+            except (TunnelError, OSError) as error:
+                self._toast(error)
+                return
+            item = self._queue_program(args, directory, "Terminal command", terminal=True)
+            if running and self.service is not None:
+                self._launch(item)
+
+        dialog.connect("response", respond)
+        dialog.present()
+
+    def _launch(self, item):
+        if self.closing or self.service is None or item.session_id is not None:
+            return
+        proxy, options, udp, ipv6 = self.service
+        args, directory, name = item.args, item.directory, item.name
         self.next_session += 1
         session_id = self.next_session
-        target = launch_target(args) or args
-        name = flatpak[1] if flatpak else Path(target[0]).name
+        item.session_id = session_id
+        self.session_programs[session_id] = item
+        self._refresh_service()
         mode = f"{proxy.address}  ·  UDP {'on' if udp else 'blocked'}  ·  IPv6 {'on' if ipv6 else 'blocked'}"
         session = self._create_session(session_id, name)
         self.sessions[session_id] = session
@@ -597,7 +749,10 @@ class Window(Adw.ApplicationWindow):
             failed = False
             launched = False
             try:
-                with Tunnel(proxy, options, udp=udp, ipv6=ipv6, output=session.log.append) as tunnel:
+                with Tunnel(
+                    proxy, options, udp=udp, ipv6=ipv6,
+                    output=session.log.append, capture_enabled=session.log.is_enabled,
+                ) as tunnel:
                     tunnel.start(session.stop)
                     if session.stop.is_set():
                         raise InterruptedError("Session cancelled.")
@@ -615,7 +770,7 @@ class Window(Adw.ApplicationWindow):
                         failed = True
                         stage = "Session failed" if launched else "Startup failed"
                         status = f"{stage} · program or isolation wrapper exited with status {exit_code}"
-                    elif time.monotonic() - started < 2:
+                    elif not item.terminal and time.monotonic() - started < 2:
                         status = "Exited quickly · an existing instance may have handled the launch"
             except InterruptedError:
                 status = "Stopped"
@@ -632,7 +787,8 @@ class Window(Adw.ApplicationWindow):
         row = Adw.ExpanderRow(title=GLib.markup_escape_text(name), subtitle="Starting · preparing a private network…")
         row.set_title_lines(1)
         row.set_subtitle_lines(2)
-        log_label = label("Live log", "field-hint")
+        log = SessionLog(enabled=self.get_application().session_logging_enabled())
+        log_label = label("Live log" if log.is_enabled() else "Log paused", "field-hint")
         log_label.set_valign(Gtk.Align.CENTER)
         row.add_action(log_label)
 
@@ -640,7 +796,6 @@ class Window(Adw.ApplicationWindow):
         cancel.set_valign(Gtk.Align.CENTER)
         row.add_action(cancel)
 
-        log = SessionLog()
         check = button("Check exit IP", lambda *_: self._check_session_exit(session_id), "small-button")
         check.set_sensitive(False)
         network = label("Available after launch.", "field-hint", wrap=True)
@@ -651,6 +806,12 @@ class Window(Adw.ApplicationWindow):
         row.add_row(drawer)
         row.connect("notify::expanded", lambda *_: log.show_latest() if row.get_expanded() else None)
         return Session(row, threading.Event(), cancel, log, log_label, check, network)
+
+    def _session_logging_changed(self, enabled):
+        for session in self.sessions.values():
+            session.log.set_enabled(enabled)
+            session.log_label.set_text("Live log" if enabled else "Log paused")
+        self._toast("Session logging resumed." if enabled else "Session logging paused.")
 
     def _reveal_session(self, row):
         def after_frame(*_):
@@ -725,6 +886,8 @@ class Window(Adw.ApplicationWindow):
         if session := self.sessions.pop(session_id, None):
             session.stop.set()
             session.tunnel = None
+            captured = session.log.is_enabled()
+            session.log.set_enabled(False)
             session.log.flush(immediate=True)
             session.row.set_subtitle(GLib.markup_escape_text(status))
             session.row.remove_css_class("session-active")
@@ -736,9 +899,12 @@ class Window(Adw.ApplicationWindow):
                 session.row.add_css_class("session-failed")
                 session.row.set_tooltip_text(status)
                 if not self.closing:
-                    session.row.set_expanded(True)
+                    if captured:
+                        session.row.set_expanded(True)
+                        self._toast("An isolated session failed. See its log for details.")
+                    else:
+                        self._toast("An isolated session failed while logging was paused.")
                     self._reveal_session(session.row)
-                    self._toast("An isolated session failed. See its log for details.")
             session.row.remove(session.button)
             dismiss = Gtk.Button.new_from_icon_name("window-close-symbolic")
             dismiss.set_tooltip_text("Remove finished session")
@@ -746,6 +912,11 @@ class Window(Adw.ApplicationWindow):
             dismiss.connect("clicked", lambda *_: self._remove_session_row(session.row))
             session.row.add_action(dismiss)
             self._update_session_count()
+        if item := self.session_programs.pop(session_id, None):
+            item.session_id = None
+        if not self.sessions:
+            self.stopping_service = False
+        self._refresh_service()
         self._complete_close()
         return False
 
@@ -771,6 +942,7 @@ class Window(Adw.ApplicationWindow):
                 self.command.set_text(shlex.quote(str(executable)))
                 self.folder.set_text(str(executable.parent))
                 self.selected_preset = None
+                self._queue_from_form()
             chooser.destroy()
 
         dialog.connect("response", response)
@@ -816,6 +988,7 @@ class Window(Adw.ApplicationWindow):
                 return
             self.selected_preset = None
             dialog.close()
+            self._queue_from_form(display_name=info.get_display_name())
 
         search.connect("search-changed", populate)
         populate()
@@ -954,10 +1127,23 @@ class Application(Adw.Application):
         version = re.sub(r"[^A-Za-z0-9_]", "_", __version__)
         app_id = f"{APP_ID}.Portable.v{version}" if self.portable else APP_ID
         super().__init__(application_id=app_id)
+        logging_action = Gio.SimpleAction.new_stateful("session-logging", None, GLib.Variant.new_boolean(True))
+        logging_action.connect("change-state", self._change_session_logging)
+        self.add_action(logging_action)
         for name, callback in (("requirements", self.requirements), ("about", self.about)):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", callback)
             self.add_action(action)
+
+    def session_logging_enabled(self):
+        return self.lookup_action("session-logging").get_state().get_boolean()
+
+    def _change_session_logging(self, action, state):
+        action.set_state(state)
+        enabled = state.get_boolean()
+        for window in self.get_windows():
+            if isinstance(window, Window):
+                window._session_logging_changed(enabled)
 
     def do_startup(self):
         Adw.Application.do_startup(self)

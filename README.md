@@ -7,13 +7,17 @@ Tundock is a native Linux desktop app for running a selected program and its chi
 Open the executable for your architecture from your file manager or run it in a terminal. If the file manager removed the executable permission on download, mark it executable in Properties or use:
 
 ```sh
-chmod +x Tundock-1.0.0-linux-x86_64
-./Tundock-1.0.0-linux-x86_64
+chmod +x Tundock-1.1.0-linux-x86_64
+./Tundock-1.1.0-linux-x86_64
 ```
 
 The bundled-engine build contains Tundock and sing-box in one Linux ELF. It loads them into a private temporary directory and removes that directory when the app exits. It uses no application installer or FUSE. Tundock keeps saved presets and proxy bookmarks in `${XDG_CONFIG_HOME:-$HOME/.config}/tundock`.
 
-Enter a proxy, select **Test connection**, choose a program, and select **Launch isolated**. The launch policy shows what Automatic, Allow or Block will do for the next session. Use **Stop** to close a session or **Save preset** to reuse its settings.
+Enter a proxy and select **Test connection** to check connectivity and protocol support. Use **Installed apps**, **Browse**, or **Add to list** to prepare programs in the current window. **Start proxy service** enables the list without opening programs. Play buttons start individual private tunnels with the active service settings. **Stop proxy service** closes every session it started. Use **Save preset** to keep a program together with settings across restarts.
+
+### Run a terminal command
+
+Select **Terminal command…** beside **Browse**. Enter a Bash command, including pipes or redirections if needed. Use **Run command** while the service is active, or add it to the list and use its play button later. Commands run noninteractively, with the chosen working folder and the service’s private TUN. Standard output and errors appear in **Sessions** when capture is on. Command text stays in the window unless you explicitly save it elsewhere.
 
 ### Save and reuse proxy addresses
 
@@ -21,11 +25,11 @@ Use **Save proxy** to name the current address. Open **Saved proxies** to select
 
 ### See what happened after Launch
 
-Open the arrow on the program's row under **Sessions**, or select **Latest log**. Each drawer shows the most recent 500 lines from Tundock, the proxy engine, and the program's standard output and errors. Tundock keeps them in memory for this window. The program can also keep its own logs independently. Standard output availability depends on what the program emits.
+Open the arrow on the program's row under **Sessions**, or select **Latest log**. Each drawer shows the most recent 500 lines from Tundock, the proxy engine, and the program's standard output and errors. Tundock keeps them in memory for this window. The program can also keep its own logs independently. Standard output availability depends on what the program emits. Clear **Capture session logs** in the app menu to pause collection across all sessions. Turning capture back on resumes with new messages. Previously captured lines stay visible.
 
 **Check exit IP** performs an HTTPS request to Cloudflare from that running session. This measures the session's tunnel egress. Use the same drawer's `Proxy` outbound lines to see connections going to the configured upstream. Programs with their own application-level proxy can still make an additional proxy hop.
 
-Tundock detects an existing copy of common browsers and directly matched executables. Close the existing app before launching it with a different proxy. A program that reuses an existing copy through its own desktop services may exit quickly, which Tundock marks as a possible handoff. Launch the actual program executable rather than a desktop URL, terminal-only menu entry, or a command that hands execution back to the host. Standard Flatpak application entries inherit the session network. A standard self-activation entry that uses `gapplication launch` is started through the Flatpak’s default command inside the private session. Desktop portals may still be limited by the session's integration settings.
+Tundock detects an existing copy of common browsers and directly matched executables. To put an already open program in TUN, quit it and launch it via its play button. A running process and its existing sockets cannot be moved into this rootless network namespace from the outside. A program that reuses an existing copy through its own desktop services may exit quickly, which Tundock marks as a possible handoff. Launch the actual program executable rather than a desktop URL, terminal-only menu entry, or a command that hands execution back to the host. Standard Flatpak application entries inherit the session network. A standard self-activation entry that uses `gapplication launch` is started through the Flatpak’s default command inside the private session. Desktop portals may still be limited by the session's integration settings.
 
 ### Host requirements
 
@@ -66,7 +70,7 @@ TUNDOCK_SING_BOX=/path/to/sing-box /usr/bin/python3 tests/integration.py
   --engine /path/to/sing-box \
   --engine-license /path/to/sing-box-notices.txt \
   --engine-source https://github.com/SagerNet/sing-box/tree/v1.14.4 \
-  /tmp/Tundock-1.0.0-linux-x86_64
+  /tmp/Tundock-1.1.0-linux-x86_64
 ```
 
 Use the exact license notices and source location for the binary you bundle. `--portable-notices` displays the bundled notice and source reference. The builder writes a companion SHA-256 file. `./packaging/make-release.sh /tmp` produces a source archive.
@@ -75,4 +79,4 @@ The integration test uses local echo services and an isolated proxy to exercise 
 
 ## راهنمای سریع
 
-فایل اجرایی را باز کن. پراکسی خود را وارد کن و روی **Test connection** بزن. با **Installed apps** یا **Browse** برنامه را انتخاب کن و **Launch isolated** را بزن. هر اجرا شبکهٔ خصوصی خودش را دارد. اگر تست UDP یا IPv6 نتیجه ندهد، حالت خودکار آن پروتکل را برای اجرای بعدی مسدود می‌کند. در صورت نیاز به ورود از طریق مرورگر یا سرویس‌های دسکتاپ، گزینهٔ **Share desktop services** در تنظیمات اتصال قرار دارد.
+فایل اجرایی را باز کن. پراکسی خود را وارد کن و روی **Test connection** بزن. با **Installed apps** یا **Browse** برنامه را به فهرست اضافه کن. هر اجرا شبکهٔ خصوصی خودش را دارد. ابتدا **Start proxy service** و سپس فلش اجرای همان برنامه را بزن. اگر تست UDP یا IPv6 نتیجه ندهد، حالت خودکار آن پروتکل را برای اجرای بعدی مسدود می‌کند. در صورت نیاز به ورود از طریق مرورگر یا سرویس‌های دسکتاپ، گزینهٔ **Share desktop services** در تنظیمات اتصال قرار دارد.
