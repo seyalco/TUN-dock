@@ -7,8 +7,8 @@ Tundock is a native Linux desktop app for running a selected program and its chi
 Open the executable for your architecture from your file manager or run it in a terminal. If the file manager removed the executable permission on download, mark it executable in Properties or use:
 
 ```sh
-chmod +x Tundock-0.3.0-linux-x86_64
-./Tundock-0.3.0-linux-x86_64
+chmod +x Tundock-1.0.0-linux-x86_64
+./Tundock-1.0.0-linux-x86_64
 ```
 
 The bundled-engine build contains Tundock and sing-box in one Linux ELF. It loads them into a private temporary directory and removes that directory when the app exits. It uses no application installer or FUSE. Tundock keeps saved presets and proxy bookmarks in `${XDG_CONFIG_HOME:-$HOME/.config}/tundock`.
@@ -66,7 +66,7 @@ TUNDOCK_SING_BOX=/path/to/sing-box /usr/bin/python3 tests/integration.py
   --engine /path/to/sing-box \
   --engine-license /path/to/sing-box-notices.txt \
   --engine-source https://github.com/SagerNet/sing-box/tree/v1.14.4 \
-  /tmp/Tundock-0.3.0-linux-x86_64
+  /tmp/Tundock-1.0.0-linux-x86_64
 ```
 
 Use the exact license notices and source location for the binary you bundle. `--portable-notices` displays the bundled notice and source reference. The builder writes a companion SHA-256 file. `./packaging/make-release.sh /tmp` produces a source archive.
