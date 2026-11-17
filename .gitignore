@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+
+# Local release outputs and configuration
+/build/
+/dist/
+/release/
+/releases/
+/Tundock-*-linux-*
+/tundock-*.tar.gz*
+/sing-box
+*.AppImage
+*.exe
+.env*

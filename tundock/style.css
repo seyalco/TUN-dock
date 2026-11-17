@@ -1,0 +1,96 @@
+.tundock {
+  font-family: Inter, Cantarell, Sans;
+}
+
+.workspace { background-color: mix(@window_bg_color, #7564bf, .035); }
+.topbar { border-bottom: 1px solid alpha(@window_fg_color, .08); }
+.wordmark { font-weight: 800; font-size: 16px; letter-spacing: .2px; }
+.brand-icon { color: #a999ff; }
+
+.sidebar {
+  padding: 26px 14px 21px 16px;
+  background-color: mix(@window_bg_color, @window_fg_color, .045);
+  border-right: 1px solid alpha(@window_fg_color, .09);
+}
+.sidebar-title { font-size: 15px; font-weight: 800; padding-left: 7px; }
+.sidebar-footnote { font-size: 12px; color: alpha(@window_fg_color, .66); padding: 7px; }
+.presets { background: transparent; }
+.presets row { border-radius: 9px; margin-bottom: 5px; }
+.presets row:hover { background-color: alpha(@window_fg_color, .07); }
+
+.content { padding: 22px 24px 24px; }
+.action-bar {
+  padding: 11px 24px;
+  border-top: 1px solid alpha(@window_fg_color, .10);
+  background-color: @window_bg_color;
+}
+.hero {
+  padding: 21px 22px;
+  border-radius: 16px;
+  background-image: linear-gradient(115deg, #29214d 0%, #302a5d 61%, #22244a 100%);
+  color: #f4f0ff;
+  border: 1px solid #4a4173;
+}
+.headline { font-size: 28px; font-weight: 850; letter-spacing: -.8px; }
+.subheading { font-size: 13px; color: #d4c9ef; }
+.hero-icon {
+  min-width: 64px;
+  min-height: 64px;
+  border-radius: 18px;
+  background-color: #4c3e78;
+  color: #ddd2ff;
+}
+.card {
+  padding: 13px 15px 12px;
+  border: 1px solid alpha(@window_fg_color, .10);
+  border-radius: 13px;
+  background-color: @card_bg_color;
+}
+.section-title { font-size: 15px; font-weight: 800; }
+.field-hint { color: alpha(@window_fg_color, .68); font-size: 12px; }
+.protocol-plan {
+  padding: 8px 10px;
+  border-radius: 8px;
+  background-color: alpha(#8370d6, .12);
+  color: @window_fg_color;
+  font-weight: 650;
+  font-size: 12px;
+}
+.dependency-notice {
+  padding: 9px 12px;
+  border-radius: 10px;
+  background-color: alpha(#ca883c, .14);
+}
+.mono { font-family: "IBM Plex Mono", monospace; font-size: 13px; }
+.metric {
+  padding: 10px 9px;
+  border-radius: 10px;
+  border: 1px solid alpha(@window_fg_color, .09);
+  background-color: @card_bg_color;
+}
+.metric-label { font-size: 11px; color: alpha(@window_fg_color, .69); }
+.metric-state { font-weight: 750; font-size: 12px; }
+.verified { background-color: alpha(#23a783, .15); border-color: alpha(#23a783, .36); }
+.limited { background-color: alpha(#ca883c, .13); border-color: alpha(#ca883c, .36); }
+.session-log-drawer { padding: 10px 14px 12px; }
+.session-log {
+  border: 1px solid alpha(@window_fg_color, .12);
+  border-radius: 8px;
+  background-color: mix(@window_bg_color, @window_fg_color, .035);
+}
+.session-log textview, .session-log textview text {
+  background-color: transparent;
+  font-size: 12px;
+}
+.session-active { border-left: 3px solid #35a685; }
+.session-failed { border-left: 3px solid #ca5d52; }
+.launch-button {
+  background-color: #7654df;
+  color: white;
+  font-weight: 780;
+  padding-left: 13px;
+  padding-right: 13px;
+}
+.launch-button:hover { background-color: #6946d2; }
+.test-button, .small-button { font-size: 12px; }
+.stop-button { font-size: 12px; }
