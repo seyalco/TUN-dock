@@ -7,13 +7,13 @@ Tundock is a native Linux desktop app for running a selected program and its chi
 Open the executable for your architecture from your file manager or run it in a terminal. If the file manager removed the executable permission on download, mark it executable in Properties or use:
 
 ```sh
-chmod +x Tundock-1.4.0-linux-x86_64
-./Tundock-1.4.0-linux-x86_64
+chmod +x Tundock-1.5.0-linux-x86_64
+./Tundock-1.5.0-linux-x86_64
 ```
 
-The bundled-engine build contains Tundock and sing-box in one Linux ELF. It loads them into a private temporary directory and removes that directory when the app exits. It uses no application installer or FUSE. Tundock keeps saved presets and proxy bookmarks in `${XDG_CONFIG_HOME:-$HOME/.config}/tundock`.
+The release executable contains Tundock in one Linux ELF. Install [sing-box 1.14 or later](https://sing-box.sagernet.org/installation/) with Clash API support, or set `TUNDOCK_SING_BOX` to a compatible executable. Tundock keeps saved presets and proxy bookmarks in `${XDG_CONFIG_HOME:-$HOME/.config}/tundock`.
 
-Enter a proxy and select **Test connection** to check connectivity and protocol support. Use **Installed apps**, **Browse**, or **Add to list** to prepare programs. **Start Session** creates the stage’s private namespace and TUN. The **Run** button on each row launches that item and its children into that network. **Stop Session** takes those programs offline and leaves their windows and processes running. The **Stop** button on a program’s row still closes that program. Use **Save preset** to keep a program and its settings across restarts.
+Enter a proxy and select **Test connection** to check connectivity and protocol support. Use **Installed apps**, **Browse**, or **Add to list** to prepare programs. **Start Session** creates a private namespace and TUN. The **Run** button on each row launches that item and its children into that network. **Stop Session** takes those programs offline and leaves their windows and processes running. Each program’s **Stop** button closes that program. Use **Save preset** to keep a program and its settings across restarts.
 
 While the session is stopped, you can edit the proxy address and settings. **Start Session** reattaches the tunnel to the retained namespace so the apps can open fresh connections. Connections that were interrupted by Stop may need to reconnect. Tundock releases the namespace after the session is stopped and the last program exits.
 
@@ -21,15 +21,13 @@ When closing the main window with programs running, **Keep running** hides Tundo
 
 ### Switch to direct access
 
-Turn off **Use upstream proxy** to send new connections directly through the host’s network while the stage and its programs keep running. Turn it back on to use the session’s configured proxy. Connections already open keep their original route until they close. DNS for new lookups follows the selected route. You can also start a session in direct mode with an empty proxy field. To change the upstream address or the IPv6 policy for a running stage, start a new session with the updated settings.
+Turn off **Use upstream proxy** to send new connections directly through the host’s network while the session and its programs keep running. Turn it back on to use the configured proxy. Connections already open keep their original route until they close. DNS for new lookups follows the selected route. You can start in direct mode with an empty proxy field. Stop and start the session to apply a different upstream address or IPv6 policy.
 
-Pass `--new-instance` to the executable to open an independent Tundock process. Each stage has its own namespace and uniquely named TUN interface.
+Pass `--new-instance` to open an independent Tundock process with its own namespace and TUN interface.
 
-### Use VPN Dock as the second proxy
+### Use VPN Dock as an upstream
 
-**Stage A** and **Stage B** have separate proxy settings, program lists, and sessions. Current VPN Dock versions run independently. Enter proxy A in VPN Dock and use its localhost output as the proxy address in Stage B.
-
-For legacy VPN Dock releases with Tundock export support, use **Add VPN Dock** in Stage A and run it from its row. In Stage B, **Use A output** fills in the localhost endpoint allocated to that run. Start Stage B and run the consumer apps from its list.
+Start [VPN Dock](https://github.com/seyalco/VPN-dock) independently. Once it shows **Ready**, enter its SOCKS5 or HTTP CONNECT localhost address in Tundock’s proxy field and start the session.
 
 ### Run a terminal command
 
@@ -53,7 +51,7 @@ Python 3.10+, GTK 4, libadwaita 1.2+, PyGObject, bubblewrap, util-linux (`nsente
 
 On Fedora, the desktop and networking tools are provided by `python3-gobject gtk4 libadwaita bubblewrap util-linux iproute`. The executable's `--check-runtime` checks the host tools and the engine without opening a window. Use the in-app test to verify that the current account can create a working TUN.
 
-For an existing Tundock-managed application-menu entry, `./install.sh --use-portable /absolute/path/to/Tundock` points it to the portable file and updates the icon. Keep that file at a stable path.
+From the extracted source package, run `./install.sh --use-portable /absolute/path/to/Tundock` to register the executable and its icon in your application menu. Keep the executable at a stable path. Tundock follows the desktop’s light or dark appearance setting.
 
 ## Proxy addresses and capabilities
 
@@ -70,7 +68,7 @@ The connection test sends HTTPS and, when supported, an NTP request to Cloudflar
 
 ## Isolation and compatibility
 
-- Each stage gets a separate Linux network namespace with its own loopback and TUN. Programs enter it only when launched through Tundock. Stopping or losing the engine leaves its programs running with private loopback access. Their external connections stay offline until the tunnel starts again. When upstream mode is selected, direct access requires an explicit switch.
+- Each session uses a separate Linux network namespace with its own loopback and TUN. Programs enter it when launched through Tundock. Stopping or losing the engine leaves the programs running with private loopback access. Their external connections remain offline until the tunnel starts again. When upstream mode is selected, direct access requires an explicit switch.
 - **Share desktop services** allows the program to use the desktop session bus for portals and sign-in. Some programs depend on those services. Work delegated to host applications and services runs outside the tunnel.
 - Close any copy of a single-instance program before launching it. A program may otherwise hand the request to an existing host process, for example via its own Unix socket. Sandboxed packages, helper daemons and programs that require elevated privileges may need their own integration.
 - Tundock is for running trusted applications with isolated IP routing. It shares your filesystem and display session with the program. It is not a security sandbox for software you don't trust.
@@ -82,16 +80,17 @@ From a source checkout, `./run-tundock` opens the app. For source runs, install 
 ```sh
 /usr/bin/python3 -m unittest discover -s tests -p 'test_*.py'
 TUNDOCK_SING_BOX=/path/to/sing-box /usr/bin/python3 tests/integration.py
-./packaging/make-portable.sh \
-  --engine /path/to/sing-box \
-  --engine-license /path/to/sing-box-notices.txt \
-  --engine-source https://github.com/SagerNet/sing-box/tree/v1.14.4 \
-  /tmp/Tundock-1.4.0-linux-x86_64
+./packaging/make-portable.sh /tmp/Tundock-1.5.0-linux-x86_64
+./packaging/make-release.sh /tmp
 ```
 
-Use the exact license notices and source location for the binary you bundle. `--portable-notices` displays the bundled notice and source reference. The builder writes a companion SHA-256 file. `./packaging/make-release.sh /tmp` produces a source archive.
+The builder writes a companion SHA-256 file. The source archive includes the launcher source and desktop registration files.
 
-The integration test uses local echo services and isolated proxies to exercise TCP, UDP, IPv6, loopback, HTTP CONNECT, engine loss, and reattaching running apps to a different upstream in the same namespace. See the [0.2 audit and release brief](docs/upgrade-0.2.md). The bundled executable is a local release candidate. Before public distribution, select Tundock's license and verify the corresponding-source arrangements for the bundled engine.
+The integration test uses local echo services and isolated proxies to exercise TCP, UDP, IPv6, loopback, HTTP CONNECT, engine loss, and reattaching running apps to a different upstream in the same namespace.
+
+## License
+
+Tundock is licensed under GPL-3.0-or-later. See [LICENSE](LICENSE) and the portable launcher’s [third-party notices](THIRD-PARTY-NOTICES).
 
 ## راهنمای سریع
 

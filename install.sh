@@ -80,10 +80,8 @@ if [[ -L "$desktop" ]] || { [[ -e "$desktop" ]] && ! grep -qx 'X-Tundock-Managed
 fi
 
 if [[ -n "$portable" ]]; then
-    if [[ ! -f "$marker" || ! -f "$desktop" ]]; then
-        printf 'No existing Tundock-managed menu entry to update. The portable executable runs directly.\n' >&2
-        exit 1
-    fi
+    install -d -- "$destination" "$(dirname -- "$desktop")"
+    touch -- "$marker"
 else
     if [[ -L "$launcher" ]] || { [[ -e "$launcher" ]] && [[ $(sed -n '2p' "$launcher") != '# Managed by Tundock' ]]; }; then
         printf 'An unmanaged launcher already exists at %s\n' "$launcher" >&2
@@ -139,8 +137,8 @@ def portable_entry():
     settings = lines[start:end]
     if "X-Tundock-Managed=true" not in {line.strip() for line in settings}:
         raise SystemExit("The desktop entry is unmanaged.")
-    values = [f"Exec={desktop_quote(portable)}\n", f"Icon={icon_name}\n"]
-    settings = [line for line in settings if not line.startswith(("Exec=", "Icon="))]
+    values = [f"Exec={desktop_quote(portable)}\n", f"Icon={icon_name}\n", f"StartupWMClass={icon_name}\n"]
+    settings = [line for line in settings if not line.startswith(("Exec=", "Icon=", "StartupWMClass="))]
     return "".join(lines[:start] + values + settings + lines[end:])
 
 def install_icon():
@@ -156,8 +154,11 @@ def install_icon():
     write_atomic(icon, payload, 0o644)
     write_atomic(icon_marker, hashlib.sha256(payload).hexdigest() + "\n", 0o644)
 
-if portable:
+if portable and desktop.is_file():
     entry = portable_entry()
+elif portable:
+    template = (source / "packaging/io.github.tundock.Tundock.desktop.in").read_text()
+    entry = template.replace("@LAUNCHER@", desktop_quote(portable)) + "X-Tundock-Managed=true\n"
 else:
     wrapper = "#!/usr/bin/env bash\n# Managed by Tundock\n"
     if engine:

@@ -5,6 +5,7 @@ GenericName=Per-app proxy launcher
 Comment=Run an application in its own TUN network
 Exec=@LAUNCHER@
 Icon=io.github.tundock.Tundock
+StartupWMClass=io.github.tundock.Tundock
 Terminal=false
 Categories=Network;
 Keywords=Proxy;SOCKS;Tunnel;TUN;VPN;

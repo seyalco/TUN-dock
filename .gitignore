@@ -12,3 +12,10 @@ __pycache__/
 *.AppImage
 *.exe
 .env*
+*.log
+*.log.*
+*.sock
+*.pid
+/.pytest_cache/
+/runtime/
+/test-data/

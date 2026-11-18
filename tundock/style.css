@@ -1,11 +1,6 @@
-.tundock {
-  font-family: Inter, Cantarell, Sans;
-}
-
-.workspace { background-color: mix(@window_bg_color, #7564bf, .035); }
+.workspace { background-color: mix(@window_bg_color, @accent_bg_color, .025); }
 .topbar { border-bottom: 1px solid alpha(@window_fg_color, .08); }
 .wordmark { font-weight: 800; font-size: 16px; letter-spacing: .2px; }
-.brand-icon { color: #a999ff; }
 
 .sidebar {
   padding: 26px 14px 21px 16px;
@@ -27,18 +22,19 @@
 .hero {
   padding: 21px 22px;
   border-radius: 16px;
-  background-image: linear-gradient(115deg, #29214d 0%, #302a5d 61%, #22244a 100%);
-  color: #f4f0ff;
-  border: 1px solid #4a4173;
+  background-image: linear-gradient(115deg,
+    mix(@window_bg_color, @accent_bg_color, .14),
+    mix(@card_bg_color, @accent_bg_color, .065));
+  color: @window_fg_color;
+  border: 1px solid alpha(@accent_bg_color, .3);
 }
 .headline { font-size: 28px; font-weight: 850; letter-spacing: -.8px; }
-.subheading { font-size: 13px; color: #d4c9ef; }
+.subheading { font-size: 13px; color: alpha(@window_fg_color, .76); }
 .hero-icon {
   min-width: 64px;
   min-height: 64px;
   border-radius: 18px;
-  background-color: #4c3e78;
-  color: #ddd2ff;
+  background-color: alpha(@accent_bg_color, .16);
 }
 .card {
   padding: 13px 15px 12px;
@@ -51,7 +47,7 @@
 .protocol-plan {
   padding: 8px 10px;
   border-radius: 8px;
-  background-color: alpha(#8370d6, .12);
+  background-color: alpha(@accent_bg_color, .12);
   color: @window_fg_color;
   font-weight: 650;
   font-size: 12px;
@@ -59,7 +55,7 @@
 .dependency-notice {
   padding: 9px 12px;
   border-radius: 10px;
-  background-color: alpha(#ca883c, .14);
+  background-color: alpha(@warning_bg_color, .14);
 }
 .mono { font-family: "IBM Plex Mono", monospace; font-size: 13px; }
 .metric {
@@ -70,8 +66,8 @@
 }
 .metric-label { font-size: 11px; color: alpha(@window_fg_color, .69); }
 .metric-state { font-weight: 750; font-size: 12px; }
-.verified { background-color: alpha(#23a783, .15); border-color: alpha(#23a783, .36); }
-.limited { background-color: alpha(#ca883c, .13); border-color: alpha(#ca883c, .36); }
+.verified { background-color: alpha(@success_bg_color, .15); border-color: alpha(@success_bg_color, .36); }
+.limited { background-color: alpha(@warning_bg_color, .13); border-color: alpha(@warning_bg_color, .36); }
 .session-log-drawer { padding: 10px 14px 12px; }
 .session-log {
   border: 1px solid alpha(@window_fg_color, .12);
@@ -82,17 +78,19 @@
   background-color: transparent;
   font-size: 12px;
 }
-.session-active { border-left: 3px solid #35a685; }
-.session-failed { border-left: 3px solid #ca5d52; }
+.session-active { border-left: 3px solid @success_color; }
+.session-failed { border-left: 3px solid @destructive_color; }
 .launch-button {
-  background-color: #7654df;
-  color: white;
+  background-color: @accent_bg_color;
+  color: @accent_fg_color;
   font-weight: 780;
   padding-left: 13px;
   padding-right: 13px;
 }
-.launch-button:hover { background-color: #6946d2; }
-.launch-button.active-session { background-color: #a12f53; }
-.launch-button.active-session:hover { background-color: #b83c64; }
+.launch-button:hover { background-color: mix(@accent_bg_color, @accent_fg_color, .12); }
+.launch-button.active-session { background-color: @destructive_bg_color; color: @destructive_fg_color; }
+.launch-button.active-session:hover {
+  background-color: mix(@destructive_bg_color, @destructive_fg_color, .12);
+}
 .test-button, .small-button { font-size: 12px; }
 .stop-button { font-size: 12px; }

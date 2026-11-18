@@ -9,7 +9,7 @@ name=tundock-$version
 staging=$(mktemp -d)
 trap 'rm -r -- "$staging"' EXIT
 install -d "$staging/$name"/{tundock,tests,packaging/portable,docs}
-cp -- "$root"/{README.md,run-tundock,install.sh} "$staging/$name/"
+cp -- "$root"/{LICENSE,README.md,THIRD-PARTY-NOTICES,run-tundock,install.sh} "$staging/$name/"
 cp -- "$root"/tundock/*.py "$root"/tundock/{style.css,tundock.png} "$staging/$name/tundock/"
 cp -- "$root"/tests/*.py "$staging/$name/tests/"
 cp -- "$root"/packaging/{make-release.sh,make-portable.sh,io.github.tundock.Tundock.desktop.in} "$staging/$name/packaging/"
