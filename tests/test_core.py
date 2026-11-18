@@ -64,7 +64,13 @@ class LaunchTests(unittest.TestCase):
 
     def test_paused_capture_discards_diagnostic_and_app_output(self):
         from collections import deque
-        from io import BytesIO
+        import os
+
+        def input_pipe(data):
+            read, write = os.pipe()
+            with os.fdopen(write, "wb") as writer:
+                writer.write(data)
+            return os.fdopen(read, "rb")
 
         output = []
         tail = deque()
@@ -74,11 +80,11 @@ class LaunchTests(unittest.TestCase):
                         output=lambda source, line: output.append((source, line)),
                         capture_enabled=lambda: enabled)
         tunnel._emit("Network", "paused diagnostic")
-        tunnel._drain(BytesIO(b"paused app output\n"), "App", tail).join()
+        tunnel._drain(input_pipe(b"paused app output\n"), "App", tail).join()
         self.assertFalse(output)
         self.assertFalse(tail)
         enabled = True
-        tunnel._drain(BytesIO(b"visible app output\n"), "App", tail).join()
+        tunnel._drain(input_pipe(b"visible app output\n"), "App", tail).join()
         self.assertEqual(output, [("App", "visible app output")])
         self.assertEqual(list(tail), ["visible app output"])
 

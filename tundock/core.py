@@ -3,11 +3,13 @@
 from collections import deque
 from contextlib import ExitStack
 from dataclasses import dataclass, field
+from http.client import HTTPConnection, HTTPException
 import ipaddress
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -20,6 +22,7 @@ import threading
 import time
 from urllib.parse import quote, unquote, urlsplit
 
+from .capture import capture_lines
 from .launchcheck import already_running, delegation, flatpak_target, private_flatpak_args, running_flatpak
 from .proxy_export import ProxyExport
 
@@ -169,6 +172,8 @@ def dependency_paths():
 
 
 def network_modes(proxy, options, report):
+    if proxy is None:
+        return options.udp != "Block", options.ipv6 != "Block"
     udp = proxy.scheme == "socks5" and (
         options.udp == "Allow" or (options.udp == "Automatic" and report.udp.verified)
     )
@@ -176,22 +181,30 @@ def network_modes(proxy, options, report):
     return udp, ipv6
 
 
-def engine_config(proxy, options, holder, udp, ipv6, *, log_level="fatal"):
+def engine_config(proxy, options, holder, udp, ipv6, *, log_level="fatal", device=DEVICE,
+                  controller=None, initial_direct=False):
     resolver_ip, resolver_name = RESOLVERS[options.resolver]
-    outbound = {
-        "type": "socks" if proxy.scheme == "socks5" else "http",
-        "tag": "upstream",
-        "server": proxy.host,
-        "server_port": proxy.port,
-    }
-    if proxy.username:
-        outbound.update(username=proxy.username, password=proxy.password)
-    if proxy.scheme == "socks5":
-        outbound["version"] = "5"
-        if not udp:
-            outbound["network"] = "tcp"
-    if proxy.scheme == "https":
-        outbound["tls"] = {"enabled": True, "server_name": proxy.host}
+    outbounds = []
+    if proxy:
+        outbound = {"type": "socks" if proxy.scheme == "socks5" else "http", "tag": "upstream",
+                    "server": proxy.host, "server_port": proxy.port}
+        if proxy.username:
+            outbound.update(username=proxy.username, password=proxy.password)
+        if proxy.scheme == "socks5":
+            outbound["version"] = "5"
+            if not udp:
+                outbound["network"] = "tcp"
+        if proxy.scheme == "https":
+            outbound["tls"] = {"enabled": True, "server_name": proxy.host}
+        outbounds.append(outbound)
+    if proxy is None or controller:
+        outbounds.append({"type": "direct", "tag": "direct"})
+    egress = "upstream" if proxy else "direct"
+    if controller:
+        egress = "egress"
+        outbounds.append({"type": "selector", "tag": egress, "outbounds": ["upstream", "direct"],
+                          "default": "direct" if initial_direct else "upstream",
+                          "interrupt_exist_connections": False})
     addresses = ["172.30.88.1/30"]
     if ipv6:
         addresses.append("fd2d:7140:88::1/126")
@@ -201,32 +214,37 @@ def engine_config(proxy, options, holder, udp, ipv6, *, log_level="fatal"):
             "tag": "doh",
             "server": resolver_ip,
             "tls": {"server_name": resolver_name},
-            "detour": "upstream",
         }],
         "final": "doh",
     }
+    if proxy:
+        dns["servers"][0]["detour"] = egress
     if not ipv6:
         dns["strategy"] = "ipv4_only"
     rules = [{"port": 53, "action": "hijack-dns"}]
-    if not udp:
+    if options.udp == "Block" or (not controller and not udp):
         rules.append({"network": "udp", "action": "reject"})
-    return {
+    config = {
         "log": {"level": log_level, "disabled": False},
         "network_namespaces": [{"type": "unshare", "tag": "app", "pid_file": str(holder)}],
         "dns": dns,
         "inbounds": [{
             "type": "tun",
             "netns": "app",
-            "interface_name": DEVICE,
+            "interface_name": device,
             "address": addresses,
             "mtu": 1400,
             "auto_route": True,
             "strict_route": True,
             "dns_mode": "disabled",
         }],
-        "outbounds": [outbound],
-        "route": {"rules": rules, "final": "upstream"},
+        "outbounds": outbounds,
+        "route": {"rules": rules, "final": egress},
     }
+    if controller:
+        address, secret = controller
+        config["experimental"] = {"clash_api": {"external_controller": address, "secret": secret}}
+    return config
 
 
 def stop_process(process):
@@ -274,18 +292,21 @@ def run_process(args, *, timeout, stop=None, input_text=None, **kwargs):
             stop_process(process)
 
 
-def engine_version(tools, stop=None):
+def engine_version(tools, stop=None, *, selector=False):
     check = run_process([tools["sing-box"], "version"], timeout=4, stop=stop)
     match = re.search(r"sing-box version (\d+\.\d+)([^\s]*)", check.stdout)
     if check.returncode or not match or tuple(map(int, match[1].split("."))) < (1, 14):
         raise TunnelError("Install sing-box 1.14 or newer for rootless per-app networking.")
+    if selector and not re.search(r"(?m)^Tags:.*\bwith_clash_api\b", check.stdout):
+        raise TunnelError("Use a sing-box build with Clash API support for live route switching.")
     return match[1] + match[2]
 
 
 class Tunnel:
     """A private network namespace held open by a host-side sing-box process."""
 
-    def __init__(self, proxy, options, *, udp, ipv6, output=None, capture_enabled=None, export=None):
+    def __init__(self, proxy, options, *, udp, ipv6, output=None, capture_enabled=None, export=None,
+                 switchable=False, initial_direct=False):
         self.proxy, self.options = proxy, options
         self.udp, self.ipv6 = udp, ipv6
         self.files = ExitStack()
@@ -295,6 +316,13 @@ class Tunnel:
         self.export = export
         self.output = output
         self.capture_enabled = capture_enabled
+        self.direct = proxy is None or initial_direct
+        self.switchable = switchable
+        self.device = "td" + secrets.token_hex(5)
+        self._control = None
+        self._closing = threading.Event()
+        self._lifecycle_lock = threading.Lock()
+        self._apps = set()
         self._readers = []
         self._engine_tail = deque(maxlen=12)
         self._app_tail = deque(maxlen=8)
@@ -311,7 +339,8 @@ class Tunnel:
         line = data.decode(errors="replace")
         line = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))", "", line)
         line = "".join(char for char in line if char == "\t" or char.isprintable()).strip()
-        for secret in (self.proxy.username, self.proxy.password):
+        credentials = (self.proxy.username, self.proxy.password) if self.proxy else ()
+        for secret in credentials:
             if not secret:
                 continue
             for value in {secret, quote(secret, safe="")}:
@@ -321,17 +350,21 @@ class Tunnel:
                     line = re.sub(r"(?<!\w)" + re.escape(value) + r"(?!\w)", "[redacted]", line)
         return line
 
-    def _drain(self, pipe, source, tail=None):
+    def _drain(self, pipe, source, tail=None, *, output=None, capture_enabled=None):
+        allowed = capture_enabled if capture_enabled is not None else self._capture_allowed
+        output = output if output is not None else self.output
+
         def read():
             with pipe:
-                while data := pipe.readline(4096):
-                    if not self._capture_allowed():
+                for data in capture_lines(pipe, allowed):
+                    if not allowed():
                         continue
                     line = self._safe_line(data)
-                    if line and self._capture_allowed():
+                    if line and allowed():
                         if tail is not None:
                             tail.append(line)
-                        self._emit(source, line)
+                        if output is not None and allowed():
+                            output(source, line)
 
         reader = threading.Thread(target=read, name=f"tundock-{source.lower()}-output", daemon=True)
         reader.start()
@@ -342,8 +375,13 @@ class Tunnel:
         return self
 
     def __exit__(self, *_):
+        self._closing.set()
+        with self._lifecycle_lock:
+            apps = tuple(self._apps)
+            self._apps.clear()
         try:
-            stop_process(self.app)
+            for process in apps:
+                stop_process(process)
         finally:
             try:
                 stop_process(self.engine)
@@ -354,15 +392,21 @@ class Tunnel:
                     self.files.close()
 
     def start(self, stop=None):
-        if self.export and self.export.feeds(self.proxy):
+        if self.export and self.proxy and self.export.feeds(self.proxy):
             raise TunnelError("Stage A cannot use the host endpoint that its VPN Dock session exports.")
         self.tools = dependency_paths()
-        version = engine_version(self.tools, stop)
+        version = engine_version(self.tools, stop, selector=bool(self.switchable and self.proxy))
         self._emit("Network", f"Preparing private TUN with sing-box {version}.")
         self.directory = Path(self.files.enter_context(tempfile.TemporaryDirectory(prefix="tundock-")))
         holder = self.directory / "namespace.pid"
+        if self.switchable and self.proxy:
+            with socket.socket() as reserved:
+                reserved.bind(("127.0.0.1", 0))
+                self._control = (reserved.getsockname()[1], secrets.token_urlsafe(32))
+        controller = (f"127.0.0.1:{self._control[0]}", self._control[1]) if self._control else None
         config = engine_config(self.proxy, self.options, holder, self.udp, self.ipv6,
-                               log_level="info" if self.output else "fatal")
+                               log_level="info" if self.output else "fatal", device=self.device,
+                               controller=controller, initial_direct=self.direct)
         # sing-box can reopen its configuration. A RAM-backed file supports repeated reads.
         fd = os.memfd_create("tundock-config", os.MFD_CLOEXEC)
         with os.fdopen(fd, "wb") as memory:
@@ -381,16 +425,23 @@ class Tunnel:
             require_active(stop)
             if self.engine.poll() is not None:
                 engine_reader.join(0.3)
-                detail = self._engine_tail[-1] if self._engine_tail else ""
+                detail = self._engine_tail[-1] if self._engine_tail and self._capture_allowed() else ""
                 raise TunnelError(detail or "sing-box stopped before the tunnel was ready.")
             if not self.ns_fds:
                 self._open_namespaces(holder)
             ipv4_ready = self.ns_fds and self._link_ready() and self._route_ready("4", "1.1.1.1")
             if ipv4_ready and (not self.ipv6 or self._route_ready("6", "2606:4700:4700::1111")):
                 require_active(stop)
+                if self._control and not self._selection_ready():
+                    if stop is not None:
+                        stop.wait(0.05)
+                    else:
+                        time.sleep(0.05)
+                    continue
                 self._prepare_dns()
-                self._emit("Network", f"Private TUN {DEVICE} is ready. Upstream: {self.proxy.address}.")
-                self._emit("Network", f"DNS through {self.options.resolver} DoH over the proxy.")
+                route = "Direct" if self.direct else self.proxy.address
+                self._emit("Network", f"Private TUN {self.device} is ready · {route}.")
+                self._emit("Network", f"DNS through {self.options.resolver} DoH.")
                 return
             if stop is None:
                 time.sleep(0.05)
@@ -399,6 +450,44 @@ class Tunnel:
         if self.ipv6 and ipv4_ready:
             raise IPv6RouteUnavailable("The private TUN could not establish an IPv6 route.")
         raise TunnelError("TUN did not become ready. Check unprivileged user namespaces and /dev/net/tun.")
+
+    def _selector_request(self, method, selection=None):
+        port, token = self._control
+        request = HTTPConnection("127.0.0.1", port, timeout=0.6)
+        body = json.dumps({"name": selection}) if selection else None
+        try:
+            request.request(method, "/proxies/egress", body,
+                            {"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+            response = request.getresponse()
+            data = response.read(4096)
+            if method == "PUT":
+                return response.status == 204
+            return json.loads(data).get("now") if response.status == 200 else None
+        except (OSError, HTTPException, ValueError):
+            return None
+        finally:
+            request.close()
+
+    def _selection_ready(self):
+        return self._selector_request("GET") == ("direct" if self.direct else "upstream")
+
+    def set_direct(self, direct):
+        with self._lifecycle_lock:
+            self._require_running()
+            if not self._control:
+                if direct == self.direct:
+                    return
+                raise TunnelError("Start a new session with an upstream proxy to switch routes.")
+            desired = "direct" if direct else "upstream"
+            if (self._selector_request("GET") != desired and not self._selector_request("PUT", desired)
+                    and self._selector_request("GET") != desired):
+                raise TunnelError("The route switch could not be confirmed.")
+            self.direct = direct
+            self._emit("Network", "New connections use direct access." if direct else "New connections use the upstream proxy.")
+
+    def _require_running(self):
+        if self._closing.is_set() or not self.ns_fds or self.engine is None or self.engine.poll() is not None:
+            raise TunnelError("The isolated session is no longer running.")
 
     def _open_namespaces(self, holder):
         try:
@@ -436,11 +525,11 @@ class Tunnel:
         return rows[0] if rows else {}
 
     def _link_ready(self):
-        flags = self._ip_info("link", "show", "dev", DEVICE).get("flags", ())
+        flags = self._ip_info("link", "show", "dev", self.device).get("flags", ())
         return "UP" in flags and "LOWER_UP" in flags
 
     def _route_ready(self, family, target):
-        return self._ip_info(f"-{family}", "route", "get", target).get("dev") == DEVICE
+        return self._ip_info(f"-{family}", "route", "get", target).get("dev") == self.device
 
     def _prepare_dns(self):
         (self.directory / "resolv.conf").write_text(f"nameserver {DNS_ADDRESS}\noptions timeout:3 attempts:2\n")
@@ -455,6 +544,7 @@ class Tunnel:
     def command(self, args, *, flatpak=False):
         user_ns = [
             *self._enter(), self.tools["bwrap"], "--unshare-user", "--unshare-pid",
+            "--uid", str(os.getuid()), "--gid", str(os.getgid()), "--cap-drop", "ALL",
             "--die-with-parent", "--bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc",
         ]
         system_services = ("/run/systemd/resolve", "/run/nscd", "/var/run/nscd", "/run/dbus")
@@ -486,7 +576,7 @@ class Tunnel:
             key: value for key, value in os.environ.items()
             if key.lower() not in {"all_proxy", "http_proxy", "https_proxy", "no_proxy", "ftp_proxy"}
             and key not in {"RES_OPTIONS", "LOCALDOMAIN", "HOSTALIASES",
-                            "VPNDOCK_EXPORT_SOCKET", "VPNDOCK_EXPORT_PORT"}
+                            "VPNDOCK_EXPORT_SOCKET", "VPNDOCK_EXPORT_PORT", "WAYLAND_SOCKET"}
         }
 
     def run(self, args, *, cwd=None, timeout=10, stop=None):
@@ -496,11 +586,23 @@ class Tunnel:
         )
 
     def launch(self, args, cwd, *, interactive=False, stop=None):
+        if self.app is not None:
+            raise TunnelError("This private session has already launched a program.")
+        self.app = self.spawn(args, cwd, interactive=interactive, stop=stop, export=self.export)
+
+    def spawn(self, args, cwd, *, interactive=False, stop=None, output=None, capture_enabled=None, export=None):
         require_active(stop)
         if problem := delegation(args):
             raise TunnelError(problem)
-        if self.app is not None:
-            raise TunnelError("This private session has already launched a program.")
+        if export and self.proxy and export.feeds(self.proxy):
+            raise TunnelError("The upstream proxy and the exported endpoint must use different ports.")
+        output = output if output is not None else self._emit
+        capture_enabled = capture_enabled if capture_enabled is not None else self._capture_allowed
+
+        def note(message):
+            if capture_enabled():
+                output("Network", message)
+
         flatpak = flatpak_target(args)
         if flatpak:
             executable, app_id, app_index = flatpak
@@ -508,50 +610,69 @@ class Tunnel:
                 raise TunnelError(f"{app_id} is already running. Close its other windows and retry.")
             args, direct = private_flatpak_args(args, app_id, app_index)
             if direct:
-                self._emit("Network", "Starting the Flatpak executable directly instead of sending a D-Bus launch request.")
-            self._emit("Network", f"Flatpak {app_id} will inherit this session's private network.")
-        elif self.export is None and (other := already_running(args, cwd=cwd)):
+                note("Starting the Flatpak executable inside the private network.")
+            note(f"Flatpak {app_id} will inherit this session's private network.")
+        elif export is None and (other := already_running(args, cwd=cwd)):
             raise TunnelError(f"This program is already running (PID {other}). Close its other windows and retry. "
                               "An existing process keeps its original network.")
         require_active(stop)
-        marker = self.directory / "app.started"
-        expected = f"net:[{os.fstat(self.ns_fds[1]).st_ino}]"
-        args = [sys.executable, str(ROOT / "app_runner.py"), str(marker), expected, *args]
-        capture = not interactive and self.output is not None
-        environment = self.environment()
-        if self.export:
-            environment.update(self.export.environment)
-        if capture:
-            environment.setdefault("PYTHONUNBUFFERED", "1")
-        self.app = subprocess.Popen(
-            self.command(args, flatpak=bool(flatpak)), cwd=cwd, env=environment, pass_fds=self.ns_fds,
-            start_new_session=True, stdout=subprocess.PIPE if capture else (None if interactive else subprocess.DEVNULL),
-            stderr=None if interactive else subprocess.PIPE,
-            stdin=None if interactive else subprocess.DEVNULL,
-        )
-        if capture:
-            self._drain(self.app.stdout, "App")
-        error_reader = self._drain(self.app.stderr, "App stderr", self._app_tail) if not interactive else None
-        deadline = time.monotonic() + 6
-        while time.monotonic() < deadline:
-            require_active(stop)
-            status = self.app.poll()
-            if marker.exists():
-                if marker.read_text() != expected:
-                    raise TunnelError("The program did not enter the expected private network.")
-                self._emit("Network", f"Program execution verified inside the private namespace ({expected}).")
-                return
-            if status is not None:
-                if error_reader:
-                    error_reader.join(0.3)
-                detail = self._app_tail[-1] if self._app_tail else f"Exit status {status}."
-                raise TunnelError(f"The program did not start in the private network. {detail}")
-            time.sleep(0.025)
-        raise TunnelError("The program did not confirm startup inside the private network in time.")
+        with self._lifecycle_lock:
+            self._require_running()
+            marker = self.directory / f"app-{secrets.token_hex(8)}.started"
+            expected = f"net:[{os.fstat(self.ns_fds[1]).st_ino}]"
+            args = [sys.executable, str(ROOT / "app_runner.py"), str(marker), expected, *args]
+            environment = self.environment()
+            if export:
+                environment.update(export.environment)
+            if not interactive:
+                environment.setdefault("PYTHONUNBUFFERED", "1")
+            process = subprocess.Popen(
+                self.command(args, flatpak=bool(flatpak)), cwd=cwd, env=environment, pass_fds=self.ns_fds,
+                start_new_session=True, stdout=None if interactive else subprocess.PIPE,
+                stderr=None if interactive else subprocess.PIPE,
+                stdin=None if interactive else subprocess.DEVNULL,
+            )
+            self._apps.add(process)
+            tail = deque(maxlen=1)
+            if not interactive:
+                self._readers = [reader for reader in self._readers if reader.is_alive()]
+                self._drain(process.stdout, "App", output=output, capture_enabled=capture_enabled)
+                error_reader = self._drain(process.stderr, "App stderr", tail,
+                                           output=output, capture_enabled=capture_enabled)
+        try:
+            deadline = time.monotonic() + 6
+            while time.monotonic() < deadline:
+                require_active(stop)
+                require_active(self._closing)
+                if marker.exists():
+                    if marker.read_text() != expected:
+                        raise TunnelError("The program did not enter the expected private network.")
+                    note(f"Program execution verified inside the private namespace ({expected}).")
+                    return process
+                if (status := process.poll()) is not None:
+                    if not interactive:
+                        error_reader.join(0.3)
+                    detail = tail[-1] if tail and capture_enabled() else f"Exit status {status}."
+                    raise TunnelError(f"The program did not start in the private network. {detail}")
+                self._closing.wait(0.025)
+            raise TunnelError("The program did not confirm startup inside the private network in time.")
+        except BaseException:
+            self.stop_app(process)
+            raise
+        finally:
+            marker.unlink(missing_ok=True)
 
-    def check_exit(self, stop=None):
+    def stop_app(self, process):
+        with self._lifecycle_lock:
+            if process not in self._apps:
+                return
+            stop_process(process)
+            self._apps.remove(process)
+
+    def check_exit(self, stop=None, *, process=None):
         with self._exit_check_lock:
-            if self.app is None or self.app.poll() is not None or self.engine.poll() is not None:
+            self._require_running()
+            if process is not None and process.poll() is not None:
                 raise TunnelError("The isolated session is no longer running.")
             response = self.run(
                 [sys.executable, "-m", "tundock.probe", "--exit-ip"], cwd=ROOT.parent, timeout=9, stop=stop,

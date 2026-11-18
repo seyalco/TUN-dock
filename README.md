@@ -7,31 +7,37 @@ Tundock is a native Linux desktop app for running a selected program and its chi
 Open the executable for your architecture from your file manager or run it in a terminal. If the file manager removed the executable permission on download, mark it executable in Properties or use:
 
 ```sh
-chmod +x Tundock-1.2.0-linux-x86_64
-./Tundock-1.2.0-linux-x86_64
+chmod +x Tundock-1.3.0-linux-x86_64
+./Tundock-1.3.0-linux-x86_64
 ```
 
 The bundled-engine build contains Tundock and sing-box in one Linux ELF. It loads them into a private temporary directory and removes that directory when the app exits. It uses no application installer or FUSE. Tundock keeps saved presets and proxy bookmarks in `${XDG_CONFIG_HOME:-$HOME/.config}/tundock`.
 
-Enter a proxy and select **Test connection** to check connectivity and protocol support. Use **Installed apps**, **Browse**, or **Add to list** to prepare programs in the current window. **Start proxy service** enables the list without opening programs. Play buttons start individual private tunnels with the active service settings. **Stop proxy service** closes every session it started. Use **Save preset** to keep a program together with settings across restarts.
+Enter a proxy and select **Test connection** to check connectivity and protocol support. Use **Installed apps**, **Browse**, or **Add to list** to prepare programs. **Start Session** creates the stage’s private namespace and TUN. The **Run** button on each row launches that item and its children into that network. **Stop Session** closes those processes and releases the tunnel. Use **Save preset** to keep a program and its settings across restarts.
+
+### Switch to direct access
+
+Turn off **Use upstream proxy** to send new connections directly through the host’s network while the stage and its programs keep running. Turn it back on to use the session’s configured proxy. Connections already open keep their original route until they close. DNS for new lookups follows the selected route. You can also start a session in direct mode with an empty proxy field. To change the upstream address or the IPv6 policy for a running stage, start a new session with the updated settings.
+
+Pass `--new-instance` to the executable to open an independent Tundock process. Each stage has its own namespace and uniquely named TUN interface.
 
 ### Use VPN Dock as the second proxy
 
-**Stage A** and **Stage B** have separate proxy settings, program lists, and start/stop controls. Configure the upstream proxy A and use **Add VPN Dock** on Stage A to queue the portable VPN Dock executable. Start the A service and use the play button for VPN Dock. Connect the VPN using its own window.
+**Stage A** and **Stage B** have separate proxy settings, program lists, and sessions. Current VPN Dock versions run independently. Enter proxy A in VPN Dock and use its localhost output as the proxy address in Stage B.
 
-Tundock owns a host-side endpoint on `127.0.0.1:1089` for that VPN Dock launch. In Stage B, select **Use A output**, then start its service and run the consumer apps through their play buttons. The same port accepts SOCKS5 and HTTP CONNECT. A refuses to use its own B endpoint as an upstream. Proxied flows close if the export disappears. For VPNs that need UDP transport, A must support UDP.
+For legacy VPN Dock releases with Tundock export support, use **Add VPN Dock** in Stage A and run it from its row. In Stage B, **Use A output** fills in the localhost endpoint allocated to that run. Start Stage B and run the consumer apps from its list.
 
 ### Run a terminal command
 
-Select **Terminal command…** beside **Browse**. Enter a Bash command, including pipes or redirections if needed. Use **Run command** while the service is active, or add it to the list and use its play button later. Commands run noninteractively, with the chosen working folder and the service’s private TUN. Standard output and errors appear in **Sessions** when capture is on. Command text stays in the window unless you explicitly save it elsewhere.
+Select **Add Command** beside **Browse**. Enter a Bash command, including pipes or redirections if needed. Use **Run command** while the session is active, or add it to the list and use its play button later. Commands run noninteractively, with the chosen working folder and the session’s private TUN. Standard output and errors appear in **Sessions** when capture is on. Command text stays in the window unless you explicitly save it elsewhere.
 
 ### Save and reuse proxy addresses
 
 Use **Save proxy** to name the current address. Open **Saved proxies** to select it for the next session or remove it with the delete button. Only the name and address are stored. Applying a bookmark clears proxy sign-in fields. **Save preset** remains available for storing a program together with its session settings.
 
-### See what happened after Launch
+### Inspect application output
 
-Open the arrow on the program's row under **Sessions**, or select **Latest log**. Each drawer shows the most recent 500 lines from Tundock, the proxy engine, and the program's standard output and errors. Tundock keeps them in memory for this window. The program can also keep its own logs independently. Standard output availability depends on what the program emits. Clear **Capture session logs** in the app menu to pause collection across all sessions. Turning capture back on resumes with new messages. Previously captured lines stay visible.
+Open the program’s log from its row or expand its entry under **Sessions**. Each drawer holds up to 500 lines in memory. Clear **Enable Logging** in the app menu to pause collection across all sessions. Tundock discards subprocess output while capture is off. Previously captured lines stay visible. Programs manage their own log files independently.
 
 **Check exit IP** performs an HTTPS request to Cloudflare from that running session. This measures the session's tunnel egress. Use the same drawer's `Proxy` outbound lines to see connections going to the configured upstream. Programs with their own application-level proxy can still make an additional proxy hop.
 
@@ -60,14 +66,14 @@ The connection test sends HTTPS and, when supported, an NTP request to Cloudflar
 
 ## Isolation and compatibility
 
-- Each launch gets a separate Linux network namespace with its own loopback and TUN. The engine creates routes only in that namespace. The only configured outbound is the proxy you supply. Losing the engine closes the session. Losing the upstream leaves no direct network route.
+- Each stage session gets a separate Linux network namespace with its own loopback and TUN. Programs enter it only when launched through Tundock. Losing the engine closes the session. When upstream mode is selected, a failed proxy keeps that mode and direct access requires an explicit switch.
 - **Share desktop services** allows the program to use the desktop session bus for portals and sign-in. Some programs depend on those services. Work delegated to host applications and services runs outside the tunnel.
 - Close any copy of a single-instance program before launching it. A program may otherwise hand the request to an existing host process, for example via its own Unix socket. Sandboxed packages, helper daemons and programs that require elevated privileges may need their own integration.
 - Tundock is for running trusted applications with isolated IP routing. It shares your filesystem and display session with the program. It is not a security sandbox for software you don't trust.
 
 ## Develop and package
 
-From a source checkout, `./run-tundock` opens the app. For source runs, install [sing-box 1.14 or later](https://sing-box.sagernet.org/installation/) or set `TUNDOCK_SING_BOX` to an existing binary. Go and Python are needed to build a portable executable. No runtime toolchain is needed.
+From a source checkout, `./run-tundock` opens the app. For source runs, install [sing-box 1.14 or later](https://sing-box.sagernet.org/installation/) with Clash API support or set `TUNDOCK_SING_BOX` to a compatible binary. Go and Python are used to build the portable executable.
 
 ```sh
 /usr/bin/python3 -m unittest discover -s tests -p 'test_*.py'
@@ -76,7 +82,7 @@ TUNDOCK_SING_BOX=/path/to/sing-box /usr/bin/python3 tests/integration.py
   --engine /path/to/sing-box \
   --engine-license /path/to/sing-box-notices.txt \
   --engine-source https://github.com/SagerNet/sing-box/tree/v1.14.4 \
-  /tmp/Tundock-1.2.0-linux-x86_64
+  /tmp/Tundock-1.3.0-linux-x86_64
 ```
 
 Use the exact license notices and source location for the binary you bundle. `--portable-notices` displays the bundled notice and source reference. The builder writes a companion SHA-256 file. `./packaging/make-release.sh /tmp` produces a source archive.
@@ -85,4 +91,4 @@ The integration test uses local echo services and an isolated proxy to exercise 
 
 ## راهنمای سریع
 
-فایل اجرایی را باز کن. پراکسی خود را وارد کن و روی **Test connection** بزن. با **Installed apps** یا **Browse** برنامه را به فهرست اضافه کن. هر اجرا شبکهٔ خصوصی خودش را دارد. ابتدا **Start proxy service** و سپس فلش اجرای همان برنامه را بزن. اگر تست UDP یا IPv6 نتیجه ندهد، حالت خودکار آن پروتکل را برای اجرای بعدی مسدود می‌کند. در صورت نیاز به ورود از طریق مرورگر یا سرویس‌های دسکتاپ، گزینهٔ **Share desktop services** در تنظیمات اتصال قرار دارد.
+فایل اجرایی را باز کن. با **Installed apps** یا **Browse** برنامه را به فهرست اضافه کن. ابتدا **Start Session** و سپس فلش اجرای همان برنامه را بزن. برای اتصال مستقیم، **Use upstream proxy** را خاموش کن. نشست و برنامه‌ها باز می‌مانند و اتصال‌های تازه از مسیر مستقیم برقرار می‌شوند. گزینهٔ **Share desktop services** در تنظیمات اتصال قرار دارد.

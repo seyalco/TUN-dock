@@ -52,6 +52,8 @@ def already_running(args, *, cwd=None):
         return None
     executable = target[0]
     name = Path(executable).name
+    if name in BROWSER_BINARIES["firefox"] and any(arg in {"-no-remote", "--no-remote"} for arg in target[1:]):
+        return None
     if re.fullmatch(r"(?:ba|da|fi|z|k)?sh|python[0-9.]*|node|nodejs|deno|perl|ruby|java|flatpak", name):
         return None
     resolved = Path(cwd or Path.home()) / executable if "/" in executable else shutil.which(executable)

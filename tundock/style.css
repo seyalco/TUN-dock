@@ -92,5 +92,7 @@
   padding-right: 13px;
 }
 .launch-button:hover { background-color: #6946d2; }
+.launch-button.active-session { background-color: #a12f53; }
+.launch-button.active-session:hover { background-color: #b83c64; }
 .test-button, .small-button { font-size: 12px; }
 .stop-button { font-size: 12px; }

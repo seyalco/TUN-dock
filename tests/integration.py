@@ -1,6 +1,7 @@
 """Integration test using only local proxy and echo services."""
 
 from contextlib import ExitStack
+import fcntl
 import json
 import os
 import shutil
@@ -29,8 +30,8 @@ class EchoUDP(socketserver.BaseRequestHandler):
         sock.sendto(data, self.client_address)
 
 
-def service(stack, kind, handler):
-    instance = stack.enter_context(kind(("127.0.0.1", 0), handler))
+def service(stack, kind, handler, address=("127.0.0.1", 0)):
+    instance = stack.enter_context(kind(address, handler))
     thread = threading.Thread(target=instance.serve_forever, daemon=True)
     thread.start()
     stack.callback(instance.shutdown)
@@ -109,6 +110,192 @@ for family, address in ((socket.AF_INET, '127.0.0.1'), (socket.AF_INET6, '::1'))
     assert run.returncode == 0, run.stderr
 
 
+SWITCH_ADDRESS = "198.18.0.2"
+
+
+class SwitchServer(socketserver.ThreadingTCPServer):
+    daemon_threads = True
+
+
+class RouteLabel(socketserver.BaseRequestHandler):
+    def handle(self):
+        label = b"direct" if self.server.server_address[0] == SWITCH_ADDRESS else b"proxied"
+        with self.request.makefile("rwb") as wire:
+            for _ in wire:
+                wire.write(label + b"\n")
+                wire.flush()
+
+
+SWITCH_CLIENT = r"""
+import fcntl
+import os
+from pathlib import Path
+import socket
+import sys
+import time
+
+directory, target, port = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+
+def publish(name, value):
+    pending = directory / (name + ".tmp")
+    pending.write_text(value)
+    pending.replace(directory / name)
+
+def connect():
+    return socket.create_connection((target, port), timeout=3)
+
+def exchange(conn):
+    with conn.makefile("rwb") as wire:
+        wire.write(b"test\n")
+        wire.flush()
+        return wire.readline().decode().strip()
+
+lifetime = (directory / "lifetime").open("w")
+fcntl.flock(lifetime, fcntl.LOCK_EX)
+publish("ready", os.readlink("/proc/self/ns/net"))
+sequence = 0
+held = None
+while True:
+    request = directory / f"request-{sequence}"
+    if not request.exists():
+        time.sleep(.015)
+        continue
+    action = request.read_text()
+    if action == "open":
+        if held is not None:
+            held.close()
+        held = connect()
+        result = exchange(held)
+    elif action == "held":
+        result = exchange(held)
+    elif action == "fresh":
+        with connect() as fresh:
+            result = exchange(fresh)
+    else:
+        raise AssertionError(action)
+    publish(f"reply-{sequence}", result)
+    sequence += 1
+"""
+
+
+class SwitchClient:
+    def __init__(self, tunnel, directory, port):
+        self.directory = directory
+        directory.mkdir()
+        self.sequence = 0
+        self.process = tunnel.spawn(
+            [sys.executable, "-c", SWITCH_CLIENT, str(directory), SWITCH_ADDRESS, str(port)],
+            directory,
+        )
+        self.namespace = self._read("ready")
+
+    def _read(self, name):
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            if (path := self.directory / name).exists():
+                return path.read_text()
+            assert self.process.poll() is None, f"{self.directory.name} exited before {name}."
+            time.sleep(.02)
+        raise AssertionError(f"{self.directory.name} did not publish {name}.")
+
+    def exchange(self, action):
+        pending = self.directory / "request.tmp"
+        pending.write_text(action)
+        pending.replace(self.directory / f"request-{self.sequence}")
+        result = self._read(f"reply-{self.sequence}")
+        self.sequence += 1
+        return result
+
+    def verify_stopped(self):
+        self.process.wait(timeout=4)
+        # A wrapper exit alone is insufficient. The live program held this lock.
+        deadline = time.monotonic() + 4
+        with (self.directory / "lifetime").open("r+") as lifetime:
+            while time.monotonic() < deadline:
+                try:
+                    fcntl.flock(lifetime, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return
+                except BlockingIOError:
+                    time.sleep(.02)
+        raise AssertionError(f"{self.directory.name} retained resources after shutdown.")
+
+
+def switch_fixture():
+    tools = dependency_paths()
+    with ExitStack() as stack:
+        directory = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="toggle-fixture-")))
+        port = service(stack, SwitchServer, RouteLabel, (SWITCH_ADDRESS, 0))
+        service(stack, SwitchServer, RouteLabel, ("127.0.0.1", port))
+        proxy = proxy_service(stack, directory, tools, "socks")
+        with Tunnel(proxy, Options(), udp=False, ipv6=False, switchable=True, initial_direct=False) as tunnel:
+            tunnel.start()
+            first = SwitchClient(tunnel, directory / "first", port)
+            second = SwitchClient(tunnel, directory / "second", port)
+            expected = f"net:[{os.fstat(tunnel.ns_fds[1]).st_ino}]"
+            assert first.namespace == second.namespace == expected
+            assert expected != os.readlink("/proc/self/ns/net")
+            assert first.exchange("open") == second.exchange("open") == "proxied"
+
+            tunnel.set_direct(True)
+            assert first.exchange("held") == second.exchange("held") == "proxied"
+            assert first.exchange("open") == second.exchange("fresh") == "direct"
+
+            tunnel.set_direct(False)
+            assert first.exchange("held") == "direct"
+            assert second.exchange("held") == second.exchange("fresh") == "proxied"
+            assert first.exchange("fresh") == "proxied"
+            assert first.process.poll() is None and second.process.poll() is None
+
+            tunnel.stop_app(first.process)
+            first.verify_stopped()
+            assert second.exchange("fresh") == "proxied"
+        second.verify_stopped()
+
+        with Tunnel(None, Options(), udp=False, ipv6=False, initial_direct=True) as direct:
+            direct.start()
+            client = SwitchClient(direct, directory / "direct", port)
+            assert client.exchange("fresh") == "direct"
+            try:
+                direct.set_direct(False)
+            except TunnelError as error:
+                assert "upstream proxy" in str(error), error
+            else:
+                raise AssertionError("A direct-only session switched to an unconfigured proxy.")
+        client.verify_stopped()
+    print("Verified shared TUN, live proxy/direct switching, established TCP, and independent app stop.")
+    print("Verified direct-only sessions and rejection of an unconfigured proxy route.")
+
+
+SWITCH_SETUP = r"""
+setpriv=$1
+ip=$2
+address=$3
+shift 3
+
+network_setup() {
+    "$setpriv" --bounding-set=-all,+net_admin --inh-caps=-all,+net_admin \
+        --ambient-caps=-all,+net_admin -- "$ip" "$@"
+}
+
+network_setup link set lo up
+network_setup -4 address add "$address/32" dev lo
+exec "$setpriv" --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- "$@"
+"""
+
+
+def check_route_switch(tools):
+    # Both test listeners are on the loopback device of an outer namespace
+    # with no uplink. Only the address setup commands have CAP_NET_ADMIN.
+    unshare, setpriv = (shutil.which(name) for name in ("unshare", "setpriv"))
+    assert unshare and setpriv, "Route-switch fixture needs unshare and setpriv."
+    subprocess.run(
+        [unshare, "--user", "--map-current-user", "--keep-caps", "--net", "--pid",
+         "--kill-child", "--mount-proc", "/bin/sh", "-eu", "-c", SWITCH_SETUP, "switch-fixture",
+         setpriv, tools["ip"], SWITCH_ADDRESS, sys.executable, str(Path(__file__).resolve()), "--switch-fixture"],
+        check=True, timeout=55,
+    )
+
+
 def main():
     tools = dependency_paths()
     route = [tools["ip"], "route", "show"]
@@ -169,10 +356,14 @@ def main():
         with Tunnel(http, Options(), udp=False, ipv6=False) as tunnel:
             tunnel.start()
             check(tunnel, "4", "tcp", "203.0.113.17", tcp_port)
+        check_route_switch(tools)
     assert subprocess.check_output(route) == host_before
     print("Verified private TCP, UDP, IPv6, HTTP CONNECT, both loopbacks, fail-closed and unchanged host routing.")
     print("Verified launch receipt, live stdout/stderr, actual upstream flow, and existing-process guard.")
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--switch-fixture"]:
+        switch_fixture()
+    else:
+        main()

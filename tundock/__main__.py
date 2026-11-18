@@ -11,6 +11,7 @@ def main():
     parser.add_argument("--version", action="version", version=f"Tundock {__version__}")
     parser.add_argument("--check-runtime", action="store_true",
                         help="check dependencies without opening the desktop window")
+    parser.add_argument("--new-instance", action="store_true", help="open a separate Tundock instance")
     options = parser.parse_args()
     try:
         from .ui import Application
@@ -28,7 +29,7 @@ def main():
     except (TunnelError, OSError, subprocess.SubprocessError) as error:
         print(f"Tundock: {error}", file=sys.stderr)
         return 1
-    return Application().run([])
+    return Application(new_instance=options.new_instance).run([])
 
 
 if __name__ == "__main__":

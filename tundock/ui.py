@@ -2,7 +2,7 @@
 
 from collections import deque
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import ipaddress
 import os
 from pathlib import Path
@@ -32,7 +32,6 @@ APP_ID = "io.github.tundock.Tundock"
 PROBE_HINT = "The test contacts Cloudflare and the selected encrypted DNS resolver through the proxy."
 VPN_PROXY_PORT = 1089
 VPN_PROXY_ADDRESS = f"socks5://127.0.0.1:{VPN_PROXY_PORT}"
-VPN_DOCK = (Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "vpndock/VPN-Dock")
 
 
 def label(title, *styles, wrap=False):
@@ -125,6 +124,11 @@ class SessionLog:
     def set_enabled(self, enabled):
         with self.lock:
             self._enabled = enabled
+            if not enabled:
+                self.pending.clear()
+                if self.flush_source:
+                    GLib.source_remove(self.flush_source)
+                    self.flush_source = 0
 
     def append(self, source, line):
         with self.lock:
@@ -173,6 +177,29 @@ class Session:
     tunnel: Tunnel | None = None
     checking: bool = False
     upstream: Proxy | None = None
+    process: subprocess.Popen | None = None
+
+
+@dataclass
+class StageService:
+    proxy: Proxy | None
+    options: Options
+    udp: bool
+    ipv6: bool
+    direct: bool
+    log: SessionLog
+    stop: threading.Event = field(default_factory=threading.Event)
+    tunnel: Tunnel | None = None
+    selecting_direct: bool | None = None
+
+    @property
+    def route(self):
+        return "Direct" if self.direct else self.proxy.address
+
+    @property
+    def detail(self):
+        udp = self.options.udp != "Block" if self.direct else self.udp
+        return f"{self.route} · UDP {'on' if udp else 'blocked'} · IPv6 {'on' if self.ipv6 else 'blocked'}"
 
 
 @dataclass
@@ -183,7 +210,10 @@ class ProgramEntry:
     terminal: bool
     row: Adw.ActionRow
     play: Gtk.Button
+    view_log: Gtk.Button
+    detail: str
     session_id: int | None = None
+    last_log: Adw.ExpanderRow | None = None
     exports_vpn: bool = False
 
 
@@ -204,6 +234,7 @@ class Window(Adw.ApplicationWindow):
         self.session_programs = {}
         self.service = None
         self.stopping_service = False
+        self._syncing_route = False
         self.selected_preset = None
         self.preset_error = None
         try:
@@ -224,7 +255,7 @@ class Window(Adw.ApplicationWindow):
         header = Adw.HeaderBar()
         header.add_css_class("topbar")
         menu = Gio.Menu()
-        menu.append("Capture session logs", "app.session-logging")
+        menu.append("Enable Logging", "app.session-logging")
         menu.append("Requirements", "app.requirements")
         menu.append("About Tundock", "app.about")
         header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu,
@@ -270,10 +301,10 @@ class Window(Adw.ApplicationWindow):
 
         if self.page == "A":
             page_title = "VPN upstream"
-            page_hint = "Select an upstream proxy and launch VPN Dock here. Its local output feeds page B."
+            page_hint = "Set up the first private service and run its programs here."
         else:
             page_title = "Isolated applications"
-            page_hint = "Use VPN Dock’s output as the proxy for the programs on this page."
+            page_hint = "Set up an independent service. Use VPN Dock’s output as its upstream when needed."
         heading = box(label(page_title, "headline", wrap=True), label(page_hint, "subheading", wrap=True),
                       vertical=True, spacing=7)
         heading.set_hexpand(True)
@@ -294,16 +325,21 @@ class Window(Adw.ApplicationWindow):
 
         proxy_title = label("Proxy", "section-title")
         proxy_title.set_hexpand(True)
-        proxy_hint = label("SOCKS5 or HTTP(S) CONNECT", "field-hint", wrap=True)
+        self.use_proxy = Gtk.Switch(active=True, valign=Gtk.Align.CENTER)
+        self.use_proxy.set_tooltip_text("Switch the route for new connections in this private tunnel.")
+        self.use_proxy.connect("notify::active", self._route_toggled)
+        proxy_hint = label("SOCKS5 or HTTP(S) CONNECT · address changes apply after restarting the service",
+                           "field-hint", wrap=True)
         proxy_hint.set_hexpand(True)
         save_proxy = button("Save proxy", self._save_bookmark, "small-button", icon="bookmark-new-symbolic")
-        proxy_card = box(box(proxy_title, self.test, spacing=12), self.proxy,
+        proxy_card = box(box(proxy_title, label("Use upstream proxy"), self.use_proxy, self.test, spacing=10), self.proxy,
                          box(proxy_hint, self.bookmark_menu, save_proxy, spacing=8),
                          vertical=True, spacing=9)
         if self.page == "B":
-            self.export_notice = label("Waiting for VPN Dock on A.", "field-hint", wrap=True)
+            self.export_notice = label("Use the SOCKS5 address shown by VPN Dock, or another upstream.",
+                                       "field-hint", wrap=True)
             self.export_notice.set_hexpand(True)
-            self.use_export = button("Use A output", self._apply_vpn_output, "small-button")
+            self.use_export = button("Use VPN Dock output", self._apply_vpn_output, "small-button")
             proxy_card.append(box(self.export_notice, self.use_export, spacing=8))
         proxy_card.add_css_class("card")
 
@@ -339,7 +375,7 @@ class Window(Adw.ApplicationWindow):
 
         browse = button("Browse", self._browse, "small-button")
         pick = button("Installed apps", self._choose_application, "small-button")
-        commands = button("Terminal command…", self._command_dialog, "small-button")
+        commands = button("Add Command", self._command_dialog, "small-button")
         add = button("Add to list", self._queue_from_form, "small-button")
         self.program_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.program_list.add_css_class("boxed-list")
@@ -347,12 +383,13 @@ class Window(Adw.ApplicationWindow):
         app_card = box(label("Programs", "section-title"), self.command, box(pick, browse, commands, add, spacing=8),
                        vertical=True, spacing=9)
         if self.page == "A":
-            self.export_notice = label("Add VPN Dock to provide the proxy on page B.", "field-hint", wrap=True)
+            self.export_notice = label("Launch the current VPN Dock separately. For a legacy version, add it here.",
+                                       "field-hint", wrap=True)
             self.export_notice.set_hexpand(True)
-            add_vpn = button("Add VPN Dock…", self._add_vpn_dock, "small-button", icon="list-add-symbolic")
+            add_vpn = button("Add legacy VPN Dock…", self._add_vpn_dock, "small-button", icon="list-add-symbolic")
             app_card.append(box(self.export_notice, add_vpn, spacing=8))
         app_card.append(self.program_list)
-        app_card.append(label("Start the service, then use a program’s play button. Quit any existing copy first.",
+        app_card.append(label("Start the service, then select Run for a program. Quit any existing copy first.",
                               "field-hint", wrap=True))
         app_card.add_css_class("card")
 
@@ -378,8 +415,8 @@ class Window(Adw.ApplicationWindow):
         advanced_group.append(advanced)
 
         save = button("Save preset", self._save_preset, icon="bookmark-new-symbolic")
-        self.service_status = label("Proxy service off", "field-hint", wrap=True)
-        self.launch_button = button("Start proxy service", self._toggle_service, "launch-button",
+        self.service_status = label("Session stopped", "field-hint", wrap=True)
+        self.launch_button = button("Start Session", self._toggle_service, "launch-button",
                                     icon="media-playback-start-symbolic")
         self.latest_session_button = button(
             "Latest log", self._view_latest_session, icon="utilities-terminal-symbolic",
@@ -392,9 +429,15 @@ class Window(Adw.ApplicationWindow):
 
         self.session_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.session_list.add_css_class("boxed-list")
-        self.empty_session = label("Open a session row to see its live log.", "field-hint", wrap=True)
-        sessions = box(label("Sessions", "section-title"), self.empty_session, self.session_list,
-                       vertical=True, spacing=9)
+        self.empty_session = label("Run a program to see its session log.", "field-hint", wrap=True)
+        self.service_log_row = Adw.ExpanderRow(title="Service log", subtitle="Tunnel startup and route changes")
+        self.service_log_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.service_log_list.add_css_class("boxed-list")
+        self.service_log_list.append(self.service_log_row)
+        self.service_log_list.set_visible(False)
+        self.service_log_view = None
+        sessions = box(label("Sessions", "section-title"), self.empty_session, self.service_log_list,
+                       self.session_list, vertical=True, spacing=9)
 
         content = box(dependency_notice, hero, proxy_card, metrics, self.probe_detail, self.protocol_plan,
                       app_card, advanced_group,
@@ -462,9 +505,9 @@ class Window(Adw.ApplicationWindow):
         elif app.vpn_export is not None:
             self.export_notice.set_text("Open your VPN in VPN Dock on A. Its output activates when its tunnel is ready.")
         elif self.page == "A":
-            self.export_notice.set_text("Add VPN Dock to provide the proxy on page B.")
+            self.export_notice.set_text("Launch the current VPN Dock separately. For a legacy version, add it here.")
         else:
-            self.export_notice.set_text("Waiting for VPN Dock on A.")
+            self.export_notice.set_text("Use the SOCKS5 address shown by VPN Dock, or another upstream.")
 
     def _validate_page_proxy(self, proxy):
         app = self.get_application()
@@ -573,11 +616,13 @@ class Window(Adw.ApplicationWindow):
 
     def _update_protocol_plan(self, report):
         if self.service is not None:
-            _, _, udp, ipv6 = self.service
             self.protocol_plan.set_text(
-                f"Active service · UDP {'on' if udp else 'off'} · IPv6 {'on' if ipv6 else 'off'} "
-                "· Setting changes apply when you restart the service."
+                f"Service route · {self.service.detail} · Proxy address changes apply after restarting."
             )
+            self.protocol_plan.set_visible(True)
+            return
+        if not self.use_proxy.get_active():
+            self.protocol_plan.set_text("Next start · Direct")
             self.protocol_plan.set_visible(True)
             return
         try:
@@ -682,52 +727,202 @@ class Window(Adw.ApplicationWindow):
         if self.service is not None:
             self._stop_service()
             return
-        else:
-            try:
+        try:
+            direct = not self.use_proxy.get_active()
+            if self.proxy.get_text().strip() or not direct:
                 proxy, options = self._input()
+            else:
+                proxy, options = None, self._options()
+            if not direct:
                 self._validate_page_proxy(proxy)
-                dependency_paths()
-            except (TunnelError, OSError) as error:
-                self._toast(error)
-                return
-            report = self.report if self.report_key == (proxy, options) else Report()
-            self.service = (proxy, options, *network_modes(proxy, options, report))
+            dependency_paths()
+        except (TunnelError, OSError) as error:
+            self._toast(error)
+            return
+        report = self.report if self.report_key == (proxy, options) else Report()
+        udp, ipv6 = network_modes(proxy, options, report)
+        log = SessionLog(enabled=self.get_application().session_logging_enabled())
+        service = StageService(proxy, options, udp, ipv6, direct, log)
+        self.service = service
+        if self.service_log_view is not None:
+            self.service_log_row.remove(self.service_log_view)
+        self.service_log_view = log.scroll
+        self.service_log_row.add_row(log.scroll)
+        self.service_log_row.set_expanded(False)
+        self.service_log_list.set_visible(True)
+        log.append("Tundock", f"Starting private tunnel on page {self.page} · {service.route}")
         self._refresh_service()
 
-    def _stop_service(self):
+        def run():
+            error = None
+            try:
+                with Tunnel(
+                    proxy, options, udp=udp, ipv6=ipv6, output=log.append, capture_enabled=log.is_enabled,
+                    switchable=True, initial_direct=direct,
+                ) as tunnel:
+                    tunnel.start(service.stop)
+                    GLib.idle_add(self._service_ready, service, tunnel)
+                    while not service.stop.wait(0.2):
+                        if tunnel.engine.poll() is not None:
+                            raise TunnelError("The private tunnel engine exited.")
+            except InterruptedError:
+                pass
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as failure:
+                if not service.stop.is_set():
+                    error = str(failure)
+                    log.append("Tundock", error)
+            finally:
+                service.stop.set()
+                GLib.idle_add(self._service_finished, service, error)
+
+        threading.Thread(target=run, name=f"tundock-stage-{self.page}", daemon=True).start()
+
+    def _service_ready(self, service, tunnel):
+        if self.service is service and not service.stop.is_set():
+            service.tunnel = tunnel
+            service.log.append("Tundock", f"Private tunnel ready · {service.route}")
+            self._refresh_service()
+        return GLib.SOURCE_REMOVE
+
+    def _service_finished(self, service, error):
+        if self.service is not service:
+            return GLib.SOURCE_REMOVE
         self.service = None
         self.stopping_service = bool(self.sessions)
         for session_id in self.sessions:
             self._stop_session(session_id)
+        service.log.append("Tundock", "Private tunnel closed.")
+        service.log.flush(immediate=True)
+        service.log.set_enabled(False)
+        if error and not self.closing:
+            self._toast(error)
+            self.service_log_row.set_expanded(True)
         self._refresh_service()
+        self._complete_close()
+        return GLib.SOURCE_REMOVE
+
+    def _stop_service(self):
+        if self.service is not None:
+            self.service.stop.set()
+        self.stopping_service = self.service is not None or bool(self.sessions)
+        for session_id in self.sessions:
+            self._stop_session(session_id)
+        self._refresh_service()
+
+    def _set_proxy_switch(self, active):
+        self._syncing_route = True
+        self.use_proxy.set_active(active)
+        self._syncing_route = False
+
+    def _route_toggled(self, *_):
+        if self._syncing_route:
+            return
+        service = self.service
+        if service is None:
+            self._update_protocol_plan(self.report or Report())
+            return
+        direct = not self.use_proxy.get_active()
+        try:
+            if service.stop.is_set() or service.tunnel is None or service.selecting_direct is not None:
+                self._set_proxy_switch(not service.direct)
+                return
+            if direct == service.direct:
+                return
+            if not direct:
+                if service.proxy is None:
+                    raise TunnelError("Enter an upstream and restart the service to enable proxy routing.")
+                self._validate_page_proxy(service.proxy)
+        except TunnelError as error:
+            self._set_proxy_switch(not service.direct)
+            self._toast(error)
+            return
+        service.selecting_direct = direct
+        self._refresh_service()
+
+        def run():
+            error = None
+            try:
+                service.tunnel.set_direct(direct)
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as failure:
+                error = str(failure)
+            GLib.idle_add(self._route_selected, service, direct, error)
+
+        threading.Thread(target=run, name="tundock-route", daemon=True).start()
+
+    def _route_selected(self, service, direct, error):
+        if self.service is not service or service.stop.is_set():
+            return GLib.SOURCE_REMOVE
+        service.selecting_direct = None
+        if error:
+            service.log.append("Network", error)
+            self._set_proxy_switch(not service.direct)
+            self._toast(error)
+        else:
+            service.direct = direct
+            self._set_proxy_switch(not direct)
+            service.log.append("Network", f"Active route changed to {service.route}.")
+            for session in self.sessions.values():
+                session.upstream = None if direct else service.proxy
+                session.log.append("Network", f"Active route changed to {service.route}.")
+                if session.process is not None and not session.stop.is_set():
+                    session.row.set_subtitle(GLib.markup_escape_text(f"Running · {service.detail}"))
+                    session.network.set_text("Check the exit IP for this route.")
+        self._refresh_service()
+        return GLib.SOURCE_REMOVE
 
     def _refresh_service(self):
         state = self.launch_button.get_child()
-        if self.stopping_service:
-            state.set_label("Stopping sessions…")
-            state.set_icon_name("process-stop-symbolic")
-            self.service_status.set_text("Closing private tunnels…")
-        elif self.service is not None:
-            state.set_label("Stop proxy service")
-            state.set_icon_name("process-stop-symbolic")
-            self.service_status.set_text(f"Ready · {self.service[0].address}")
+        service = self.service
+        if service is not None:
+            self.launch_button.add_css_class("active-session")
         else:
-            state.set_label("Start proxy service")
+            self.launch_button.remove_css_class("active-session")
+        if self.stopping_service:
+            state.set_label("Stopping…")
+            state.set_icon_name("process-stop-symbolic")
+            self.service_status.set_text("Closing private tunnel…")
+        elif service is not None:
+            state.set_label("Stop Session")
+            state.set_icon_name("process-stop-symbolic")
+            if service.tunnel is None:
+                self.service_status.set_text("Starting private tunnel…")
+            elif service.selecting_direct is not None:
+                self.service_status.set_text("Switching route…")
+            else:
+                self.service_status.set_text(f"Running · {service.route}")
+        else:
+            state.set_label("Start Session")
             state.set_icon_name("media-playback-start-symbolic")
-            self.service_status.set_text("Proxy service off")
+            self.service_status.set_text("Session stopped")
         self.launch_button.set_sensitive(not self.stopping_service)
+        ready = bool(service and service.tunnel and not service.stop.is_set() and service.selecting_direct is None)
+        self.use_proxy.set_sensitive(service is None or (ready and not any(
+            session.checking for session in self.sessions.values()
+        )))
+        for widget in (self.proxy, self.username, self.password, self.bookmark_menu):
+            widget.set_sensitive(service is None)
+        if self.page == "B":
+            self.use_export.set_sensitive(service is None)
+        for session in self.sessions.values():
+            session.check_button.set_sensitive(bool(ready and session.process is not None and not session.checking
+                                                     and not session.stop.is_set()))
         self._update_protocol_plan(self.report if self.report is not None else Report())
         export_running = any(item.exports_vpn and item.session_id is not None for item in self.programs)
         for item in self.programs:
-            can_launch = self.service is not None and item.session_id is None
-            item.play.set_sensitive(can_launch and (not item.exports_vpn or not export_running))
+            active = self.sessions.get(item.session_id)
+            content = item.play.get_child()
+            content.set_label("Stop" if active else "Run")
+            content.set_icon_name("process-stop-symbolic" if active else "media-playback-start-symbolic")
+            item.play.set_tooltip_text(f"{'Stop' if active else 'Run'} {item.name}")
+            item.play.set_sensitive(not active.stop.is_set() if active else ready and
+                                    (not item.exports_vpn or not export_running))
+            detail = active.row.get_subtitle() if active else GLib.markup_escape_text(item.detail)
+            item.row.set_subtitle(detail)
+            item.view_log.set_sensitive(item.last_log is not None)
 
     def _add_vpn_dock(self, *_):
-        if VPN_DOCK.is_file() and os.access(VPN_DOCK, os.X_OK):
-            self._queue_vpn_dock(VPN_DOCK)
-            return
         dialog = Gtk.FileChooserNative(
-            title="Choose the VPN Dock executable", transient_for=self,
+            title="Choose the legacy VPN Dock executable", transient_for=self,
             action=Gtk.FileChooserAction.OPEN, accept_label="Add VPN Dock", cancel_label="Cancel",
         )
 
@@ -771,16 +966,20 @@ class Window(Adw.ApplicationWindow):
         else:
             detail = str(directory)
         row = Adw.ActionRow(title=GLib.markup_escape_text(name), subtitle=GLib.markup_escape_text(detail))
-        play = Gtk.Button.new_from_icon_name("media-playback-start-symbolic")
-        play.set_tooltip_text(f"Run {name} in the proxy service")
+        play = button("Run", lambda *_: self._toggle_program(item), icon="media-playback-start-symbolic")
         play.set_valign(Gtk.Align.CENTER)
+        view_log = Gtk.Button.new_from_icon_name("utilities-terminal-symbolic")
+        view_log.set_tooltip_text(f"Open the latest log for {name}")
+        view_log.set_valign(Gtk.Align.CENTER)
+        view_log.add_css_class("flat")
         remove = Gtk.Button.new_from_icon_name("edit-delete-symbolic")
         remove.set_tooltip_text(f"Remove {name} from the list")
         remove.set_valign(Gtk.Align.CENTER)
         remove.add_css_class("flat")
-        item = ProgramEntry(args, directory, name, terminal, row, play, exports_vpn=exports_vpn)
-        play.connect("clicked", lambda *_: self._launch(item))
+        item = ProgramEntry(args, directory, name, terminal, row, play, view_log, detail, exports_vpn=exports_vpn)
+        view_log.connect("clicked", lambda *_: self._open_program_log(item))
         remove.connect("clicked", lambda *_: self._remove_program(item))
+        row.add_suffix(view_log)
         row.add_suffix(play)
         row.add_suffix(remove)
         self.programs.append(item)
@@ -788,6 +987,17 @@ class Window(Adw.ApplicationWindow):
         self.program_list.set_visible(True)
         self._refresh_service()
         return item
+
+    def _toggle_program(self, item):
+        if item.session_id is None:
+            self._launch(item)
+        else:
+            self._stop_session(item.session_id)
+
+    def _open_program_log(self, item):
+        if item.last_log is not None:
+            item.last_log.set_expanded(True)
+            self._reveal_session(item.last_log)
 
     def _remove_program(self, item):
         if item.session_id is not None:
@@ -798,14 +1008,15 @@ class Window(Adw.ApplicationWindow):
         self.program_list.set_visible(bool(self.programs))
 
     def _command_dialog(self, *_):
-        running = self.service is not None
+        running = bool(self.service and self.service.tunnel and not self.service.stop.is_set())
         dialog = Adw.MessageDialog(transient_for=self, heading="Terminal command",
                                    body="Run a noninteractive shell command inside a private tunnel. "
                                         "Its output appears under Sessions when logging is enabled.")
         command = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, monospace=True)
         command.set_tooltip_text("Type a shell command")
         scroll = Gtk.ScrolledWindow(child=command, min_content_height=94, min_content_width=280)
-        dialog.set_extra_child(scroll)
+        folder = Gtk.Entry(text=self.folder.get_text(), placeholder_text=str(Path.home()))
+        dialog.set_extra_child(box(scroll, label("Working folder", "field-hint"), folder, vertical=True, spacing=7))
         dialog.add_response("cancel", "Cancel")
         dialog.add_response("run", "Run command" if running else "Add to list")
         dialog.set_response_appearance("run", Adw.ResponseAppearance.SUGGESTED)
@@ -821,7 +1032,7 @@ class Window(Adw.ApplicationWindow):
                 return
             try:
                 args, directory = app_command(shlex.join(["env", "BASH_ENV=/dev/null", "bash", "--noprofile", "--norc", "-c", value]),
-                                              self.folder.get_text())
+                                              folder.get_text())
             except (TunnelError, OSError) as error:
                 self._toast(error)
                 return
@@ -833,36 +1044,40 @@ class Window(Adw.ApplicationWindow):
         dialog.present()
 
     def _launch(self, item):
-        if self.closing or self.service is None or item.session_id is not None:
+        service = self.service
+        if (self.closing or service is None or service.tunnel is None or service.stop.is_set()
+                or service.selecting_direct is not None or item.session_id is not None):
             return
-        proxy, options, udp, ipv6 = self.service
         try:
-            self._validate_page_proxy(proxy)
+            if not service.direct:
+                self._validate_page_proxy(service.proxy)
         except TunnelError as error:
             self._toast(error)
             return
         if item.exports_vpn and any(other.exports_vpn and other.session_id is not None for other in self.programs):
-            self._toast("VPN Dock is already running on A.")
+            self._toast("Legacy VPN Dock is already running on A.")
             return
+        tunnel = service.tunnel
         app = self.get_application()
         args, directory, name = item.args, item.directory, item.name
         self.next_session += 1
         session_id = self.next_session
         item.session_id = session_id
         self.session_programs[session_id] = item
-        self._refresh_service()
-        mode = f"{proxy.address}  ·  UDP {'on' if udp else 'blocked'}  ·  IPv6 {'on' if ipv6 else 'blocked'}"
         session = self._create_session(session_id, name)
-        session.upstream = proxy
+        session.upstream = None if service.direct else service.proxy
         self.sessions[session_id] = session
+        item.last_log = session.row
         self.session_list.prepend(session.row)
         self.session_list.set_visible(True)
         self.empty_session.set_visible(False)
         self.latest_session_button.set_visible(True)
+        if item.terminal:
+            session.row.set_expanded(True)
         self._update_session_count()
+        self._refresh_service()
         self._reveal_session(session.row)
-        self._toast(f"Starting {name} in a private network.")
-        session.log.append("Tundock", f"Starting {name} · {mode}")
+        session.log.append("Tundock", f"Starting {name} · {service.detail}")
 
         def run():
             status = "Closed"
@@ -872,38 +1087,36 @@ class Window(Adw.ApplicationWindow):
                 with ExitStack() as resources:
                     export = None
                     if item.exports_vpn:
-                        export = resources.enter_context(ProxyExport(port=VPN_PROXY_PORT))
+                        export = resources.enter_context(ProxyExport(port=0))
                         GLib.idle_add(app._register_vpn_export, self, session_id, export)
                         resources.callback(app._drain_vpn_export, self, session_id, export)
-                    tunnel = resources.enter_context(Tunnel(
-                        proxy, options, udp=udp, ipv6=ipv6,
-                        output=session.log.append, capture_enabled=session.log.is_enabled, export=export,
-                    ))
-                    tunnel.start(session.stop)
-                    if session.stop.is_set():
-                        raise InterruptedError("Session cancelled.")
-                    tunnel.launch(args, directory, stop=session.stop)
+                    process = tunnel.spawn(
+                        args, directory, stop=session.stop, output=session.log.append,
+                        capture_enabled=session.log.is_enabled, export=export,
+                    )
+                    resources.callback(tunnel.stop_app, process)
+                    launched = True
+                    GLib.idle_add(self._running, session_id, service, process)
                     started = time.monotonic()
-                    try:
-                        exit_code = tunnel.app.wait(timeout=0.2)
-                    except subprocess.TimeoutExpired:
-                        launched = True
-                        GLib.idle_add(self._running, session_id, mode, tunnel)
-                        exit_code = tunnel.follow(session.stop)
-                    if session.stop.is_set():
+                    while process.poll() is None and not session.stop.wait(0.2) and not service.stop.is_set():
+                        pass
+                    exit_code = process.returncode
+                    if session.stop.is_set() or service.stop.is_set():
                         status = "Stopped"
                     elif exit_code:
                         failed = True
-                        stage = "Session failed" if launched else "Startup failed"
-                        status = f"{stage} · program or isolation wrapper exited with status {exit_code}"
+                        status = f"Program exited with status {exit_code}"
                     elif not item.terminal and time.monotonic() - started < 2:
                         status = "Exited quickly · an existing instance may have handled the launch"
             except InterruptedError:
                 status = "Stopped"
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-                failed = True
-                stage = "Session failed" if launched else "Startup failed"
-                status = f"{stage} · {error}"
+                if session.stop.is_set() or service.stop.is_set():
+                    status = "Stopped"
+                else:
+                    failed = True
+                    stage = "Session failed" if launched else "Startup failed"
+                    status = f"{stage} · {error}"
             session.log.append("Tundock", status)
             GLib.idle_add(self._finished, session_id, status, failed)
 
@@ -934,6 +1147,8 @@ class Window(Adw.ApplicationWindow):
         return Session(row, threading.Event(), cancel, log, log_label, check, network)
 
     def _session_logging_changed(self, enabled):
+        if self.service is not None:
+            self.service.log.set_enabled(enabled)
         for session in self.sessions.values():
             session.log.set_enabled(enabled)
             session.log_label.set_text("Live log" if enabled else "Log paused")
@@ -959,28 +1174,33 @@ class Window(Adw.ApplicationWindow):
             row.set_expanded(True)
             self._reveal_session(row)
 
-    def _running(self, session_id, mode, tunnel):
+    def _running(self, session_id, service, process):
         session = self.sessions.get(session_id)
-        if session and not session.stop.is_set():
-            session.tunnel = tunnel
-            session.row.set_subtitle(GLib.markup_escape_text(f"Running · {mode}"))
+        if session and self.service is service and not session.stop.is_set():
+            session.tunnel = service.tunnel
+            session.process = process
+            session.upstream = None if service.direct else service.proxy
+            session.row.set_subtitle(GLib.markup_escape_text(f"Running · {service.detail}"))
             session.row.add_css_class("session-active")
-            session.check_button.set_sensitive(True)
+            session.check_button.set_sensitive(service.selecting_direct is None)
             session.network.set_text("Checks this session through Cloudflare HTTPS.")
-        return False
+            self._refresh_service()
+        return GLib.SOURCE_REMOVE
 
     def _check_session_exit(self, session_id):
         session = self.sessions.get(session_id)
-        if not session or not session.tunnel or session.checking or session.stop.is_set():
+        service = self.service
+        if (not session or not session.process or not service or service.selecting_direct is not None
+                or session.checking or session.stop.is_set()):
             return
-        tunnel = session.tunnel
+        tunnel, process = session.tunnel, session.process
         session.checking = True
         session.check_button.set_sensitive(False)
         session.network.set_text("Checking exit IP…")
 
         def run():
             try:
-                result = tunnel.check_exit(stop=session.stop)
+                result = tunnel.check_exit(stop=session.stop, process=process)
                 location = result.get("loc")
                 address = f"{result['ip']} · {location}" if location else result["ip"]
                 detail = f"Exit IP: {address}"
@@ -990,6 +1210,7 @@ class Window(Adw.ApplicationWindow):
                 detail = f"Exit IP check failed · {error}"
             GLib.idle_add(self._show_session_exit, session_id, detail)
 
+        self._refresh_service()
         threading.Thread(target=run, daemon=True).start()
 
     def _show_session_exit(self, session_id, detail):
@@ -999,6 +1220,7 @@ class Window(Adw.ApplicationWindow):
             session.network.set_text(detail)
             session.log.append("Network", detail)
             session.check_button.set_sensitive(True)
+            self._refresh_service()
         return False
 
     def _stop_session(self, session_id):
@@ -1007,6 +1229,10 @@ class Window(Adw.ApplicationWindow):
             session.button.set_sensitive(False)
             session.check_button.set_sensitive(False)
             session.row.set_subtitle("Stopping…")
+            item = self.session_programs.get(session_id)
+            if item is not None:
+                item.play.set_sensitive(False)
+                item.row.set_subtitle("Stopping…")
 
     def _stop_consuming_vpn_output(self):
         app = self.get_application()
@@ -1015,7 +1241,9 @@ class Window(Adw.ApplicationWindow):
             self._cancel_test()
         sessions = [session_id for session_id, session in self.sessions.items()
                     if session.upstream is not None and app.matches_vpn_output(session.upstream)]
-        if self.service is not None and app.matches_vpn_output(self.service[0]):
+        service = self.service
+        if (service is not None and service.proxy is not None and app.matches_vpn_output(service.proxy)
+                and (not service.direct or service.selecting_direct is False)):
             self._stop_service()
             if not self.closing:
                 self._toast("VPN Dock’s output ended. Stopping the dependent proxy service on B.")
@@ -1056,7 +1284,7 @@ class Window(Adw.ApplicationWindow):
             self._update_session_count()
         if item := self.session_programs.pop(session_id, None):
             item.session_id = None
-        if not self.sessions:
+        if not self.sessions and self.service is None:
             self.stopping_service = False
         self._refresh_service()
         self._complete_close()
@@ -1064,6 +1292,10 @@ class Window(Adw.ApplicationWindow):
 
     def _remove_session_row(self, row):
         self.session_list.remove(row)
+        for item in self.programs:
+            if item.last_log is row:
+                item.last_log = None
+                item.view_log.set_sensitive(False)
         empty = self.session_list.get_first_child() is None
         self.session_list.set_visible(not empty)
         self.empty_session.set_visible(empty)
@@ -1226,23 +1458,23 @@ class Window(Adw.ApplicationWindow):
     def _begin_close(self):
         self.closing = True
         self._cancel_test()
-        for session_id in self.sessions:
-            self._stop_session(session_id)
+        self._stop_service()
         self.set_sensitive(False)
         self._complete_close()
 
     def _complete_close(self):
-        if self.closing and not self.sessions and self.test_stop is None:
+        if self.closing and self.service is None and not self.sessions and self.test_stop is None:
             self.get_application()._page_finished(self)
             self.destroy()
 
 
 class Application(Adw.Application):
-    def __init__(self):
+    def __init__(self, new_instance=False):
         self.portable = os.getenv("TUNDOCK_PORTABLE") == "1"
         version = re.sub(r"[^A-Za-z0-9_]", "_", __version__)
         app_id = f"{APP_ID}.Portable.v{version}" if self.portable else APP_ID
-        super().__init__(application_id=app_id)
+        flags = Gio.ApplicationFlags.NON_UNIQUE if new_instance else Gio.ApplicationFlags.DEFAULT_FLAGS
+        super().__init__(application_id=app_id, flags=flags)
         self.pages = {}
         self.active_page = "A"
         self.closing = False
@@ -1250,6 +1482,7 @@ class Application(Adw.Application):
         self.vpn_export = None
         self.vpn_address = VPN_PROXY_ADDRESS
         self.vpn_ready = False
+        self.managed_vpn_ports = set()
         self._export_draining = False
         logging_action = Gio.SimpleAction.new_stateful("session-logging", None, GLib.Variant.new_boolean(True))
         logging_action.connect("change-state", self._change_session_logging)
@@ -1286,7 +1519,7 @@ class Application(Adw.Application):
                 window._render_bookmarks()
 
     def matches_vpn_output(self, proxy):
-        if proxy.port not in {VPN_PROXY_PORT, Proxy.parse(self.vpn_address).port}:
+        if proxy.port not in self.managed_vpn_ports:
             return False
         try:
             address = ipaddress.ip_address(proxy.host)
@@ -1302,6 +1535,7 @@ class Application(Adw.Application):
             return GLib.SOURCE_REMOVE
         previous_address = self.vpn_address
         self.vpn_address = export.address
+        self.managed_vpn_ports.add(Proxy.parse(export.address).port)
         self.vpn_export = export
         self.vpn_ready = bool(export.ready)
         self._export_draining = False
@@ -1344,8 +1578,10 @@ class Application(Adw.Application):
             if consumer is not None and (any(session_id in consumer.sessions for session_id in sessions)
                                          or (test is not None and consumer.test_stop is test)):
                 return GLib.SOURCE_CONTINUE
+            previous = self.vpn_address
             self.vpn_export = None
-            self._notify_vpn_output()
+            self.vpn_address = VPN_PROXY_ADDRESS
+            self._notify_vpn_output(previous)
             drained.set()
             return GLib.SOURCE_REMOVE
 
@@ -1378,7 +1614,7 @@ class Application(Adw.Application):
     def _request_close(self, requester):
         if self.closing:
             return True
-        if not any(window.sessions or window.test_stop for window in self.pages.values()):
+        if not any(window.service or window.sessions or window.test_stop for window in self.pages.values()):
             self._shutdown_requested()
             return True
         if self.close_dialog:
