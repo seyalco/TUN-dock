@@ -16,7 +16,7 @@ def main():
     try:
         from .ui import Application
         if options.check_runtime:
-            version = engine_version(dependency_paths())
+            version = engine_version(dependency_paths(), selector=True)
             print(f"Tundock {__version__} · GTK and libadwaita available · sing-box {version}")
             print("Kernel namespace permissions and proxy connectivity are checked in the window.")
             return 0

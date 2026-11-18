@@ -1,8 +1,68 @@
+from contextlib import ExitStack
 from dataclasses import replace
+import os
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
-from tundock.core import Options, Proxy, Report, Result, Tunnel, TunnelError, engine_config, network_modes
+from tundock.core import (
+    Options, Proxy, Report, Result, SingBoxUnavailable, Tunnel, TunnelError, engine_config,
+    network_modes, sing_box_path,
+)
 from tundock.launchcheck import delegation, flatpak_target, private_flatpak_args
+
+
+class EngineDiscoveryTests(unittest.TestCase):
+    def setUp(self):
+        contexts = ExitStack()
+        self.addCleanup(contexts.close)
+        directory = Path(contexts.enter_context(tempfile.TemporaryDirectory()))
+        self.source = directory / "source"
+        self.launcher = directory / "launcher"
+        self.home = directory / "home"
+        self.data = directory / "xdg"
+        self.system = directory / "system"
+        self.override = directory / "override"
+        contexts.enter_context(patch("tundock.core.ROOT", self.source / "tundock"))
+        contexts.enter_context(patch.dict(os.environ, {
+            "HOME": str(self.home), "PATH": str(self.system), "XDG_DATA_HOME": str(self.data),
+            "TUNDOCK_LAUNCHER_DIR": str(self.launcher),
+        }, clear=True))
+
+    @staticmethod
+    def add_executable(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+        path.chmod(0o755)
+
+    def test_launcher_then_source_then_local_then_path(self):
+        paths = (
+            self.launcher / "bin/sing-box", self.launcher / "sing-box",
+            self.source / "bin/sing-box", self.source / "sing-box",
+            self.data / "tundock/bin/sing-box", self.home / ".local/bin/sing-box",
+            self.system / "sing-box",
+        )
+        for path in paths:
+            self.add_executable(path)
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertEqual(sing_box_path(), str(path))
+                path.chmod(0o644)
+        with self.assertRaisesRegex(SingBoxUnavailable, r"~/.local/bin/sing-box"):
+            sing_box_path()
+
+    def test_override_is_explicit_and_relative_xdg_is_ignored(self):
+        local_engine = self.home / ".local/share/tundock/bin/sing-box"
+        os.environ["XDG_DATA_HOME"] = "relative"
+        self.add_executable(local_engine)
+        self.assertEqual(sing_box_path(), str(local_engine))
+
+        os.environ["TUNDOCK_SING_BOX"] = str(self.override)
+        with self.assertRaisesRegex(SingBoxUnavailable, "TUNDOCK_SING_BOX"):
+            sing_box_path()
+        self.add_executable(self.override)
+        self.assertEqual(sing_box_path(), str(self.override))
 
 
 class ProxyTests(unittest.TestCase):

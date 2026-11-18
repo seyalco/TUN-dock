@@ -41,6 +41,10 @@ class TunnelError(RuntimeError):
     """An actionable error for the person running Tundock."""
 
 
+class SingBoxUnavailable(TunnelError):
+    """The configured or default sing-box executable was not found."""
+
+
 class IPv6RouteUnavailable(TunnelError):
     """The tunnel has an IPv4 route but could not establish its IPv6 route."""
 
@@ -150,15 +154,41 @@ def app_command(value, directory):
     return [str(Path(executable).absolute()), *args[1:]], cwd
 
 
+def sing_box_path():
+    instructions = ("Install sing-box 1.14 or newer with Clash API support. Place the binary at "
+                    "~/.local/bin/sing-box and mark it executable, or install a compatible system package.")
+    preferred = os.environ.get("TUNDOCK_SING_BOX")
+    if preferred:
+        path = shutil.which(os.path.expanduser(preferred))
+        if path and Path(path).is_file():
+            return str(Path(path).absolute())
+        raise SingBoxUnavailable("TUNDOCK_SING_BOX does not select an executable. Fix it or unset it.\n\n"
+                                 + instructions)
+
+    home = Path.home()
+    data_home = Path(os.environ.get("XDG_DATA_HOME", ""))
+    if not data_home.is_absolute():
+        data_home = home / ".local/share"
+    launcher_directory = Path(os.environ.get("TUNDOCK_LAUNCHER_DIR", ""))
+    roots = [ROOT.parent]
+    if launcher_directory.is_absolute():
+        roots.insert(0, launcher_directory)
+    candidates = [root / name for root in roots for name in ("bin/sing-box", "sing-box")]
+    candidates.extend((data_home / "tundock/bin/sing-box", home / ".local/bin/sing-box"))
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    path = shutil.which("sing-box")
+    if path and Path(path).is_file():
+        return str(Path(path).absolute())
+    raise SingBoxUnavailable(instructions)
+
+
 def dependency_paths():
     if sys.platform != "linux" or os.geteuid() == 0:
         raise TunnelError("Run Tundock on Linux as a regular user.")
     candidates = {name: shutil.which(name) for name in ("bwrap", "nsenter", "ip")}
-    preferred = os.environ.get("TUNDOCK_SING_BOX")
-    local = Path.home() / ".local/bin/sing-box"
-    sing = (shutil.which(preferred) if preferred else
-            shutil.which("sing-box") or (str(local) if os.access(local, os.X_OK) else None))
-    candidates["sing-box"] = sing
+    candidates["sing-box"] = sing_box_path()
     missing = [name for name, path in candidates.items() if not path]
     if missing:
         raise TunnelError(f"Missing system tools: {', '.join(missing)}. See the installation guide.")

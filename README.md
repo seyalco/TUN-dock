@@ -7,11 +7,11 @@ Tundock is a native Linux desktop app for running a selected program and its chi
 Open the executable for your architecture from your file manager or run it in a terminal. If the file manager removed the executable permission on download, mark it executable in Properties or use:
 
 ```sh
-chmod +x Tundock-1.5.0-linux-x86_64
-./Tundock-1.5.0-linux-x86_64
+chmod +x Tundock-1.5.1-linux-x86_64
+./Tundock-1.5.1-linux-x86_64
 ```
 
-The release executable contains Tundock in one Linux ELF. Install [sing-box 1.14 or later](https://sing-box.sagernet.org/installation/) with Clash API support, or set `TUNDOCK_SING_BOX` to a compatible executable. Tundock keeps saved presets and proxy bookmarks in `${XDG_CONFIG_HOME:-$HOME/.config}/tundock`.
+The Linux x86-64 release executable includes sing-box 1.14.4 with Clash API support. The desktop and Linux dependencies below still apply. Tundock keeps saved presets and proxy bookmarks in `${XDG_CONFIG_HOME:-$HOME/.config}/tundock`.
 
 Enter a proxy and select **Test connection** to check connectivity and protocol support. Use **Installed apps**, **Browse**, or **Add to list** to prepare programs. **Start Session** creates a private namespace and TUN. The **Run** button on each row launches that item and its children into that network. **Stop Session** takes those programs offline and leaves their windows and processes running. Each program’s **Stop** button closes that program. Use **Save preset** to keep a program and its settings across restarts.
 
@@ -75,22 +75,31 @@ The connection test sends HTTPS and, when supported, an NTP request to Cloudflar
 
 ## Develop and package
 
-From a source checkout, `./run-tundock` opens the app. For source runs, install [sing-box 1.14 or later](https://sing-box.sagernet.org/installation/) with Clash API support or set `TUNDOCK_SING_BOX` to a compatible binary. Go and Python are used to build the portable executable.
+From a source checkout, `./run-tundock` opens the app. For source runs, install sing-box 1.14 or later with Clash API support using the [upstream package instructions](https://sing-box.sagernet.org/installation/package-manager/) or extract the executable for your architecture from an [official sing-box release](https://github.com/SagerNet/sing-box/releases). From the extracted directory, use `install -Dm755 ./sing-box "$HOME/.local/bin/sing-box"`. Run `sing-box version` and check for `with_clash_api` in the tags. If `~/.local/bin` is outside your shell’s `PATH`, run `~/.local/bin/sing-box version`.
+
+The published portable uses its embedded copy. Source runs and portable builds without an embedded engine check the following locations in order.
+
+1. The explicit `TUNDOCK_SING_BOX` override, when set.
+2. `bin/sing-box` beside the launcher, followed by `sing-box` in the same directory. For a source run, these paths are relative to the checkout.
+3. `${XDG_DATA_HOME:-$HOME/.local/share}/tundock/bin/sing-box`, then `~/.local/bin/sing-box`.
+4. `sing-box` on `$PATH`.
+
+Use `./run-tundock --check-runtime` to check the setup. Go and Python are used to build the portable executable.
 
 ```sh
 /usr/bin/python3 -m unittest discover -s tests -p 'test_*.py'
 TUNDOCK_SING_BOX=/path/to/sing-box /usr/bin/python3 tests/integration.py
-./packaging/make-portable.sh /tmp/Tundock-1.5.0-linux-x86_64
+./packaging/make-portable.sh /tmp/Tundock-1.5.1-linux-x86_64
 ./packaging/make-release.sh /tmp
 ```
 
-The builder writes a companion SHA-256 file. The source archive includes the launcher source and desktop registration files.
+The example above builds a portable that uses an external engine. To include your own engine, pass `--engine FILE --engine-license FILE --engine-source HTTPS_URL` before the output path. The builder writes a companion SHA-256 file. The source archive includes the launcher source and desktop registration files.
 
 The integration test uses local echo services and isolated proxies to exercise TCP, UDP, IPv6, loopback, HTTP CONNECT, engine loss, and reattaching running apps to a different upstream in the same namespace.
 
 ## License
 
-Tundock is licensed under GPL-3.0-or-later. See [LICENSE](LICENSE) and the portable launcher’s [third-party notices](THIRD-PARTY-NOTICES).
+Tundock is licensed under GPL-3.0-or-later. The portable includes sing-box by SagerNet, licensed under GPL-3.0-or-later with the additional terms in its upstream license notice. Run the portable with `--portable-notices` to see the licenses and link to the matching engine source. [Tundock license](LICENSE) · [Third-party notices](THIRD-PARTY-NOTICES) · [Release downloads and corresponding source](https://github.com/seyalco/TUN-dock/releases)
 
 ## راهنمای سریع
 

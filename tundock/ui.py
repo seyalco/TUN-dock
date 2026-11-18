@@ -27,7 +27,7 @@ from gi.repository import Adw, Gdk, GdkPixbuf, Gio, Gtk, Pango
 
 from . import __version__, storage
 from .core import (
-    ROOT, POLICIES, RESOLVERS, Options, Proxy, Report, Tunnel, TunnelError,
+    ROOT, POLICIES, RESOLVERS, Options, Proxy, Report, SingBoxUnavailable, Tunnel, TunnelError,
     app_command, dependency_paths, network_modes,
 )
 from .diagnostics import probe
@@ -353,6 +353,10 @@ class Window(Adw.ApplicationWindow):
         dependency_notice.set_visible(False)
         try:
             dependency_paths()
+        except SingBoxUnavailable as error:
+            dependency_text.set_text("Install sing-box to start a session.")
+            dependency_notice.set_visible(True)
+            GLib.idle_add(self._show_engine_install, error)
         except TunnelError as error:
             dependency_text.set_text(str(error))
             dependency_notice.set_visible(True)
@@ -447,6 +451,17 @@ class Window(Adw.ApplicationWindow):
     def _toast(self, message):
         self.overlay.add_toast(Adw.Toast(title=str(message)))
         return False
+
+    def _show_engine_install(self, error):
+        dialog = Adw.MessageDialog(transient_for=self, modal=True, heading="sing-box is required", body=str(error))
+        help_link = Gtk.LinkButton.new_with_label("https://sing-box.sagernet.org/installation/",
+                                                  "Open the sing-box installation guide")
+        help_link.set_halign(Gtk.Align.CENTER)
+        dialog.set_extra_child(help_link)
+        dialog.add_response("close", "Close")
+        dialog.set_close_response("close")
+        dialog.present()
+        return GLib.SOURCE_REMOVE
 
     def _options(self):
         return Options(tuple(RESOLVERS)[self.resolver.get_selected()], POLICIES[self.udp_policy.get_selected()],
@@ -614,6 +629,9 @@ class Window(Adw.ApplicationWindow):
         try:
             key = self._input()
             dependency_paths()
+        except SingBoxUnavailable as error:
+            self._show_engine_install(error)
+            return
         except TunnelError as error:
             self._toast(error)
             return
@@ -677,6 +695,9 @@ class Window(Adw.ApplicationWindow):
             else:
                 proxy, options = None, self._options()
             dependency_paths()
+        except SingBoxUnavailable as error:
+            self._show_engine_install(error)
+            return
         except (TunnelError, OSError) as error:
             self._toast(error)
             return
