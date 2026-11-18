@@ -182,7 +182,7 @@ def network_modes(proxy, options, report):
 
 
 def engine_config(proxy, options, holder, udp, ipv6, *, log_level="fatal", device=DEVICE,
-                  controller=None, initial_direct=False):
+                  controller=None, initial_direct=False, namespace_path=None):
     resolver_ip, resolver_name = RESOLVERS[options.resolver]
     outbounds = []
     if proxy:
@@ -226,7 +226,10 @@ def engine_config(proxy, options, holder, udp, ipv6, *, log_level="fatal", devic
         rules.append({"network": "udp", "action": "reject"})
     config = {
         "log": {"level": log_level, "disabled": False},
-        "network_namespaces": [{"type": "unshare", "tag": "app", "pid_file": str(holder)}],
+        "network_namespaces": [
+            {"type": "default", "tag": "app", "path": namespace_path} if namespace_path else
+            {"type": "unshare", "tag": "app", "pid_file": str(holder)},
+        ],
         "dns": dns,
         "inbounds": [{
             "type": "tun",
@@ -310,7 +313,9 @@ class Tunnel:
         self.proxy, self.options = proxy, options
         self.udp, self.ipv6 = udp, ipv6
         self.files = ExitStack()
+        self.directory = None
         self.engine = None
+        self._network_ready = False
         self.app = None
         self.ns_fds = ()
         self.export = export
@@ -379,26 +384,72 @@ class Tunnel:
         with self._lifecycle_lock:
             apps = tuple(self._apps)
             self._apps.clear()
-        try:
-            for process in apps:
-                stop_process(process)
-        finally:
             try:
-                stop_process(self.engine)
+                self._stop_network()
             finally:
+                for process in apps:
+                    stop_process(process)
                 for reader in self._readers:
                     reader.join(0.2)
-                with self._exit_check_lock:
-                    self.files.close()
+                self._release_if_idle()
+
+    def configure(self, proxy, options, *, udp, ipv6, initial_direct=False, output=None, capture_enabled=None):
+        with self._lifecycle_lock:
+            if self.engine is not None:
+                raise TunnelError("Stop the session before changing the upstream configuration.")
+            self.proxy, self.options = proxy, options
+            self.udp, self.ipv6 = udp, ipv6
+            self.direct = proxy is None or initial_direct
+            if output is not None:
+                self.output = output
+            if capture_enabled is not None:
+                self.capture_enabled = capture_enabled
+
+    def _release_if_idle(self):
+        if self.engine is not None:
+            return
+        self._apps = {process for process in self._apps if process.poll() is None}
+        if not self._apps:
+            with self._exit_check_lock:
+                self.files.close()
+                self.ns_fds = ()
+                self.directory = None
+
+    def _stop_network(self):
+        self._network_ready = False
+        stop_process(self.engine)
+        self.engine = None
+        self._control = None
+
+    def stop_network(self):
+        """Stop egress while leaving the programs and their private loopback alive."""
+        with self._lifecycle_lock:
+            self._stop_network()
+            self._release_if_idle()
 
     def start(self, stop=None):
+        with self._lifecycle_lock:
+            require_active(self._closing)
+            if self.engine is not None:
+                raise TunnelError("The isolated network is already started.")
+            try:
+                self._start_network(stop)
+            except BaseException:
+                self._stop_network()
+                self._release_if_idle()
+                raise
+
+    def _start_network(self, stop):
         if self.export and self.proxy and self.export.feeds(self.proxy):
             raise TunnelError("Stage A cannot use the host endpoint that its VPN Dock session exports.")
         self.tools = dependency_paths()
         version = engine_version(self.tools, stop, selector=bool(self.switchable and self.proxy))
         self._emit("Network", f"Preparing private TUN with sing-box {version}.")
-        self.directory = Path(self.files.enter_context(tempfile.TemporaryDirectory(prefix="tundock-")))
+        if self.directory is None:
+            self.directory = Path(self.files.enter_context(tempfile.TemporaryDirectory(prefix="tundock-")))
+            self._prepare_dns()
         holder = self.directory / "namespace.pid"
+        namespace_path = f"/proc/self/fd/{self.ns_fds[1]}" if self.ns_fds else None
         if self.switchable and self.proxy:
             with socket.socket() as reserved:
                 reserved.bind(("127.0.0.1", 0))
@@ -406,23 +457,27 @@ class Tunnel:
         controller = (f"127.0.0.1:{self._control[0]}", self._control[1]) if self._control else None
         config = engine_config(self.proxy, self.options, holder, self.udp, self.ipv6,
                                log_level="info" if self.output else "fatal", device=self.device,
-                               controller=controller, initial_direct=self.direct)
+                               controller=controller, initial_direct=self.direct, namespace_path=namespace_path)
         # sing-box can reopen its configuration. A RAM-backed file supports repeated reads.
         fd = os.memfd_create("tundock-config", os.MFD_CLOEXEC)
         with os.fdopen(fd, "wb") as memory:
             memory.write(json.dumps(config).encode())
             memory.flush()
+            private_user = ["--userns", str(self.ns_fds[0])] if self.ns_fds else []
             self.engine = subprocess.Popen(
-                [sys.executable, str(ROOT / "guard.py"), str(os.getpid()), self.tools["sing-box"],
+                [sys.executable, str(ROOT / "guard.py"), str(os.getpid()), *private_user, self.tools["sing-box"],
                  "run", "-c", f"/proc/self/fd/{fd}"],
                 cwd=self.directory, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                start_new_session=True, pass_fds=(fd,),
+                start_new_session=True, pass_fds=(fd, *self.ns_fds),
             )
+        self._engine_tail.clear()
+        self._readers = [reader for reader in self._readers if reader.is_alive()]
         engine_reader = self._drain(self.engine.stdout, "Proxy", self._engine_tail)
         deadline = time.monotonic() + 8
         ipv4_ready = False
         while time.monotonic() < deadline:
             require_active(stop)
+            require_active(self._closing)
             if self.engine.poll() is not None:
                 engine_reader.join(0.3)
                 detail = self._engine_tail[-1] if self._engine_tail and self._capture_allowed() else ""
@@ -438,7 +493,7 @@ class Tunnel:
                     else:
                         time.sleep(0.05)
                     continue
-                self._prepare_dns()
+                self._network_ready = True
                 route = "Direct" if self.direct else self.proxy.address
                 self._emit("Network", f"Private TUN {self.device} is ready · {route}.")
                 self._emit("Network", f"DNS through {self.options.resolver} DoH.")
@@ -486,7 +541,7 @@ class Tunnel:
             self._emit("Network", "New connections use direct access." if direct else "New connections use the upstream proxy.")
 
     def _require_running(self):
-        if self._closing.is_set() or not self.ns_fds or self.engine is None or self.engine.poll() is not None:
+        if self._closing.is_set() or not self._network_ready or self.engine is None or self.engine.poll() is not None:
             raise TunnelError("The isolated session is no longer running.")
 
     def _open_namespaces(self, holder):
@@ -668,6 +723,7 @@ class Tunnel:
                 return
             stop_process(process)
             self._apps.remove(process)
+            self._release_if_idle()
 
     def check_exit(self, stop=None, *, process=None):
         with self._exit_check_lock:
@@ -688,8 +744,8 @@ class Tunnel:
     def follow(self, stop):
         while self.app.poll() is None:
             require_active(stop)
-            if self.engine.poll() is not None:
-                raise TunnelError("The proxy engine stopped. The isolated session was closed.")
+            if self.engine is None or self.engine.poll() is not None:
+                raise TunnelError("The proxy engine stopped. The isolated network is offline.")
             time.sleep(0.2)
         return self.app.returncode
 

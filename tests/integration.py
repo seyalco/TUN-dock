@@ -38,23 +38,24 @@ def service(stack, kind, handler, address=("127.0.0.1", 0)):
     return instance.server_address[1]
 
 
-def proxy_config(port, protocol):
+def proxy_config(port, protocol, target_port=None):
+    rule = {"action": "route", "outbound": "echo", "override_address": "127.0.0.1"}
+    if target_port is not None:
+        rule["override_port"] = target_port
     return {
         "log": {"level": "error"},
         "inbounds": [{"type": protocol, "listen": "127.0.0.1", "listen_port": port}],
         "outbounds": [{"type": "direct", "tag": "echo"}],
-        "route": {"rules": [{
-            "action": "route", "outbound": "echo", "override_address": "127.0.0.1",
-        }], "final": "echo"},
+        "route": {"rules": [rule], "final": "echo"},
     }
 
 
-def proxy_service(stack, directory, tools, protocol):
+def proxy_service(stack, directory, tools, protocol, *, target_port=None):
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
-    config = directory / (protocol + ".json")
-    config.write_text(json.dumps(proxy_config(port, protocol)))
+    config = directory / f"{protocol}-{port}.json"
+    config.write_text(json.dumps(proxy_config(port, protocol, target_port)))
     process = subprocess.Popen([tools["sing-box"], "run", "-c", str(config)], start_new_session=True)
     stack.callback(stop_process, process)
     for _ in range(100):
@@ -118,12 +119,18 @@ class SwitchServer(socketserver.ThreadingTCPServer):
 
 
 class RouteLabel(socketserver.BaseRequestHandler):
+    proxy_label = b"proxied"
+
     def handle(self):
-        label = b"direct" if self.server.server_address[0] == SWITCH_ADDRESS else b"proxied"
+        label = b"direct" if self.server.server_address[0] == SWITCH_ADDRESS else self.proxy_label
         with self.request.makefile("rwb") as wire:
             for _ in wire:
                 wire.write(label + b"\n")
                 wire.flush()
+
+
+class ReplacementRouteLabel(RouteLabel):
+    proxy_label = b"replacement"
 
 
 SWITCH_CLIENT = r"""
@@ -152,6 +159,9 @@ def exchange(conn):
 
 lifetime = (directory / "lifetime").open("w")
 fcntl.flock(lifetime, fcntl.LOCK_EX)
+local = socket.socket()
+local.bind(("127.0.0.1", 0))
+local.listen()
 publish("ready", os.readlink("/proc/self/ns/net"))
 sequence = 0
 held = None
@@ -169,8 +179,20 @@ while True:
     elif action == "held":
         result = exchange(held)
     elif action == "fresh":
-        with connect() as fresh:
-            result = exchange(fresh)
+        try:
+            with connect() as fresh:
+                result = exchange(fresh)
+        except OSError:
+            result = "blocked"
+    elif action == "local":
+        with socket.create_connection(local.getsockname(), timeout=2) as client:
+            peer, _ = local.accept()
+            with peer:
+                peer.settimeout(2)
+                client.sendall(b"local")
+                result = peer.recv(5).decode()
+    elif action == "namespace":
+        result = os.readlink("/proc/self/ns/net")
     else:
         raise AssertionError(action)
     publish(f"reply-{sequence}", result)
@@ -227,6 +249,8 @@ def switch_fixture():
         port = service(stack, SwitchServer, RouteLabel, (SWITCH_ADDRESS, 0))
         service(stack, SwitchServer, RouteLabel, ("127.0.0.1", port))
         proxy = proxy_service(stack, directory, tools, "socks")
+        replacement_port = service(stack, SwitchServer, ReplacementRouteLabel)
+        replacement = proxy_service(stack, directory, tools, "socks", target_port=replacement_port)
         with Tunnel(proxy, Options(), udp=False, ipv6=False, switchable=True, initial_direct=False) as tunnel:
             tunnel.start()
             first = SwitchClient(tunnel, directory / "first", port)
@@ -246,10 +270,31 @@ def switch_fixture():
             assert first.exchange("fresh") == "proxied"
             assert first.process.poll() is None and second.process.poll() is None
 
+            old_engine = tunnel.engine
+            tunnel.stop_network()
+            assert old_engine.poll() is not None
+            assert tunnel.engine is None
+            assert first.exchange("namespace") == second.exchange("namespace") == expected
+            assert first.exchange("local") == second.exchange("local") == "local"
+            assert first.exchange("fresh") == second.exchange("fresh") == "blocked"
+
+            tunnel.configure(replacement, Options(), udp=False, ipv6=False)
+            tunnel.start()
+            assert f"net:[{os.fstat(tunnel.ns_fds[1]).st_ino}]" == expected
+            assert first.exchange("namespace") == second.exchange("namespace") == expected
+            assert first.exchange("fresh") == second.exchange("fresh") == "replacement"
+
             tunnel.stop_app(first.process)
             first.verify_stopped()
-            assert second.exchange("fresh") == "proxied"
-        second.verify_stopped()
+            assert second.exchange("fresh") == "replacement"
+            namespace_fds = tunnel.ns_fds
+            tunnel.stop_network()
+            assert tunnel.ns_fds == namespace_fds
+            assert second.exchange("local") == "local"
+            tunnel.stop_app(second.process)
+            second.verify_stopped()
+            assert not tunnel.ns_fds
+            assert not any(Path(f"/proc/self/fd/{fd}").is_symlink() for fd in namespace_fds)
 
         with Tunnel(None, Options(), udp=False, ipv6=False, initial_direct=True) as direct:
             direct.start()
@@ -263,6 +308,7 @@ def switch_fixture():
                 raise AssertionError("A direct-only session switched to an unconfigured proxy.")
         client.verify_stopped()
     print("Verified shared TUN, live proxy/direct switching, established TCP, and independent app stop.")
+    print("Verified offline applications retain loopback, reattach to a replacement proxy, and release the namespace when idle.")
     print("Verified direct-only sessions and rejection of an unconfigured proxy route.")
 
 
@@ -292,7 +338,7 @@ def check_route_switch(tools):
         [unshare, "--user", "--map-current-user", "--keep-caps", "--net", "--pid",
          "--kill-child", "--mount-proc", "/bin/sh", "-eu", "-c", SWITCH_SETUP, "switch-fixture",
          setpriv, tools["ip"], SWITCH_ADDRESS, sys.executable, str(Path(__file__).resolve()), "--switch-fixture"],
-        check=True, timeout=55,
+        check=True, timeout=75,
     )
 
 

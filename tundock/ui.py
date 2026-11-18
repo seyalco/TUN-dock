@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import ipaddress
 import os
 from pathlib import Path
+from queue import Empty, SimpleQueue
 import re
 import shlex
 import signal
@@ -175,9 +176,8 @@ class Session:
     check_button: Gtk.Button
     network: Gtk.Label
     tunnel: Tunnel | None = None
-    checking: bool = False
-    upstream: Proxy | None = None
     process: subprocess.Popen | None = None
+    check_stop: threading.Event | None = None
 
 
 @dataclass
@@ -189,8 +189,16 @@ class StageService:
     direct: bool
     log: SessionLog
     stop: threading.Event = field(default_factory=threading.Event)
+    commands: SimpleQueue = field(default_factory=SimpleQueue)
     tunnel: Tunnel | None = None
+    active: bool = False
+    pending: str | None = "start"
     selecting_direct: bool | None = None
+
+    @property
+    def ready(self):
+        return (self.active and self.pending is None and self.selecting_direct is None
+                and not self.stop.is_set())
 
     @property
     def route(self):
@@ -233,7 +241,6 @@ class Window(Adw.ApplicationWindow):
         self.programs = []
         self.session_programs = {}
         self.service = None
-        self.stopping_service = False
         self._syncing_route = False
         self.selected_preset = None
         self.preset_error = None
@@ -258,6 +265,7 @@ class Window(Adw.ApplicationWindow):
         menu.append("Enable Logging", "app.session-logging")
         menu.append("Requirements", "app.requirements")
         menu.append("About Tundock", "app.about")
+        menu.append("Quit Tundock", "app.quit")
         header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu,
                                        tooltip_text="Tundock menu"))
         brand_icon = self._brand_picture(24)
@@ -328,7 +336,7 @@ class Window(Adw.ApplicationWindow):
         self.use_proxy = Gtk.Switch(active=True, valign=Gtk.Align.CENTER)
         self.use_proxy.set_tooltip_text("Switch the route for new connections in this private tunnel.")
         self.use_proxy.connect("notify::active", self._route_toggled)
-        proxy_hint = label("SOCKS5 or HTTP(S) CONNECT · address changes apply after restarting the service",
+        proxy_hint = label("SOCKS5 or HTTP(S) CONNECT · stop the session to change the address",
                            "field-hint", wrap=True)
         proxy_hint.set_hexpand(True)
         save_proxy = button("Save proxy", self._save_bookmark, "small-button", icon="bookmark-new-symbolic")
@@ -389,7 +397,7 @@ class Window(Adw.ApplicationWindow):
             add_vpn = button("Add legacy VPN Dock…", self._add_vpn_dock, "small-button", icon="list-add-symbolic")
             app_card.append(box(self.export_notice, add_vpn, spacing=8))
         app_card.append(self.program_list)
-        app_card.append(label("Start the service, then select Run for a program. Quit any existing copy first.",
+        app_card.append(label("Start the session, then select Run. Stop Session pauses networking and keeps programs open.",
                               "field-hint", wrap=True))
         app_card.add_css_class("card")
 
@@ -415,7 +423,7 @@ class Window(Adw.ApplicationWindow):
         advanced_group.append(advanced)
 
         save = button("Save preset", self._save_preset, icon="bookmark-new-symbolic")
-        self.service_status = label("Session stopped", "field-hint", wrap=True)
+        self.service_status = label("Network stopped", "field-hint", wrap=True)
         self.launch_button = button("Start Session", self._toggle_service, "launch-button",
                                     icon="media-playback-start-symbolic")
         self.latest_session_button = button(
@@ -615,7 +623,7 @@ class Window(Adw.ApplicationWindow):
         self._update_protocol_plan(report)
 
     def _update_protocol_plan(self, report):
-        if self.service is not None:
+        if self.service is not None and (self.service.active or self.service.pending):
             self.protocol_plan.set_text(
                 f"Service route · {self.service.detail} · Proxy address changes apply after restarting."
             )
@@ -644,7 +652,7 @@ class Window(Adw.ApplicationWindow):
             else:
                 mode = "off (manual)"
             modes.append(f"{name} {mode}")
-        self.protocol_plan.set_text("Next launch · " + " · ".join(modes))
+        self.protocol_plan.set_text("Next start · " + " · ".join(modes))
         self.protocol_plan.set_visible(True)
 
     def _settings_changed(self, *_):
@@ -722,9 +730,10 @@ class Window(Adw.ApplicationWindow):
         return False
 
     def _toggle_service(self, *_):
-        if self.closing or self.stopping_service:
+        service = self.service
+        if self.closing or (service is not None and (service.pending or service.selecting_direct is not None)):
             return
-        if self.service is not None:
+        if service is not None and service.active:
             self._stop_service()
             return
         try:
@@ -741,54 +750,90 @@ class Window(Adw.ApplicationWindow):
             return
         report = self.report if self.report_key == (proxy, options) else Report()
         udp, ipv6 = network_modes(proxy, options, report)
-        log = SessionLog(enabled=self.get_application().session_logging_enabled())
-        service = StageService(proxy, options, udp, ipv6, direct, log)
-        self.service = service
-        if self.service_log_view is not None:
-            self.service_log_row.remove(self.service_log_view)
-        self.service_log_view = log.scroll
-        self.service_log_row.add_row(log.scroll)
-        self.service_log_row.set_expanded(False)
-        self.service_log_list.set_visible(True)
-        log.append("Tundock", f"Starting private tunnel on page {self.page} · {service.route}")
+        if service is None:
+            log = SessionLog(enabled=self.get_application().session_logging_enabled())
+            service = StageService(proxy, options, udp, ipv6, direct, log)
+            self.service = service
+            if self.service_log_view is not None:
+                self.service_log_row.remove(self.service_log_view)
+            self.service_log_view = log.scroll
+            self.service_log_row.add_row(log.scroll)
+            self.service_log_row.set_expanded(False)
+            self.service_log_list.set_visible(True)
+            threading.Thread(target=self._run_service, args=(service,), name=f"tundock-stage-{self.page}",
+                             daemon=True).start()
+        service.proxy, service.options, service.udp, service.ipv6, service.direct = proxy, options, udp, ipv6, direct
+        service.pending = "start"
+        service.log.append("Tundock", f"Starting private network on page {self.page} · {service.route}")
+        service.commands.put(("start", (proxy, options, udp, ipv6, direct)))
         self._refresh_service()
 
-        def run():
-            error = None
-            try:
-                with Tunnel(
-                    proxy, options, udp=udp, ipv6=ipv6, output=log.append, capture_enabled=log.is_enabled,
-                    switchable=True, initial_direct=direct,
-                ) as tunnel:
-                    tunnel.start(service.stop)
-                    GLib.idle_add(self._service_ready, service, tunnel)
-                    while not service.stop.wait(0.2):
-                        if tunnel.engine.poll() is not None:
-                            raise TunnelError("The private tunnel engine exited.")
-            except InterruptedError:
-                pass
-            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as failure:
-                if not service.stop.is_set():
-                    error = str(failure)
-                    log.append("Tundock", error)
-            finally:
-                service.stop.set()
-                GLib.idle_add(self._service_finished, service, error)
+    def _run_service(self, service):
+        error = None
+        try:
+            with Tunnel(
+                service.proxy, service.options, udp=service.udp, ipv6=service.ipv6, switchable=True,
+                initial_direct=service.direct, output=service.log.append, capture_enabled=service.log.is_enabled,
+            ) as tunnel:
+                active = False
+                while not service.stop.is_set():
+                    try:
+                        operation, settings = service.commands.get(timeout=0.2)
+                    except Empty:
+                        if not active or (tunnel.engine is not None and tunnel.engine.poll() is None):
+                            continue
+                        operation, settings = "lost", None
+                    if service.stop.is_set():
+                        break
+                    problem = "The private tunnel engine exited." if operation == "lost" else None
+                    try:
+                        if operation == "start":
+                            proxy, options, udp, ipv6, direct = settings
+                            tunnel.configure(proxy, options, udp=udp, ipv6=ipv6, initial_direct=direct,
+                                             output=service.log.append, capture_enabled=service.log.is_enabled)
+                            tunnel.start(service.stop)
+                        else:
+                            tunnel.stop_network()
+                    except InterruptedError:
+                        if service.stop.is_set():
+                            break
+                        problem = "The private network operation was interrupted."
+                    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as failure:
+                        problem = str(failure)
+                    active = tunnel.engine is not None and tunnel.engine.poll() is None
+                    GLib.idle_add(self._service_result, service, tunnel, operation, active, problem)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as failure:
+            error = str(failure)
+        finally:
+            service.stop.set()
+            GLib.idle_add(self._service_finished, service, error)
 
-        threading.Thread(target=run, name=f"tundock-stage-{self.page}", daemon=True).start()
-
-    def _service_ready(self, service, tunnel):
-        if self.service is service and not service.stop.is_set():
-            service.tunnel = tunnel
-            service.log.append("Tundock", f"Private tunnel ready · {service.route}")
-            self._refresh_service()
+    def _service_result(self, service, tunnel, operation, active, error):
+        if self.service is not service or service.stop.is_set():
+            return GLib.SOURCE_REMOVE
+        service.tunnel = tunnel
+        service.active = active
+        if operation == service.pending:
+            service.pending = None
+        if error:
+            service.log.append("Network", error)
+            self._toast(error)
+            self.service_log_row.set_expanded(True)
+        if service.pending is None:
+            if active:
+                detail = f"Private network ready · {service.route}"
+            else:
+                detail = "Private network stopped. Running programs are offline."
+                self._cancel_exit_checks()
+            service.log.append("Network", detail)
+            self._refresh_running_programs(service, detail)
+        self._refresh_service()
         return GLib.SOURCE_REMOVE
 
     def _service_finished(self, service, error):
         if self.service is not service:
             return GLib.SOURCE_REMOVE
         self.service = None
-        self.stopping_service = bool(self.sessions)
         for session_id in self.sessions:
             self._stop_session(session_id)
         service.log.append("Tundock", "Private tunnel closed.")
@@ -802,11 +847,12 @@ class Window(Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _stop_service(self):
-        if self.service is not None:
-            self.service.stop.set()
-        self.stopping_service = self.service is not None or bool(self.sessions)
-        for session_id in self.sessions:
-            self._stop_session(session_id)
+        service = self.service
+        if service is None or service.stop.is_set() or service.pending == "stop" or not (service.active or service.pending):
+            return
+        service.pending = "stop"
+        self._cancel_exit_checks()
+        service.commands.put(("stop", None))
         self._refresh_service()
 
     def _set_proxy_switch(self, active):
@@ -818,12 +864,12 @@ class Window(Adw.ApplicationWindow):
         if self._syncing_route:
             return
         service = self.service
-        if service is None:
+        if service is None or (not service.active and service.pending is None):
             self._update_protocol_plan(self.report or Report())
             return
         direct = not self.use_proxy.get_active()
         try:
-            if service.stop.is_set() or service.tunnel is None or service.selecting_direct is not None:
+            if not service.ready:
                 self._set_proxy_switch(not service.direct)
                 return
             if direct == service.direct:
@@ -860,63 +906,78 @@ class Window(Adw.ApplicationWindow):
         else:
             service.direct = direct
             self._set_proxy_switch(not direct)
-            service.log.append("Network", f"Active route changed to {service.route}.")
-            for session in self.sessions.values():
-                session.upstream = None if direct else service.proxy
-                session.log.append("Network", f"Active route changed to {service.route}.")
-                if session.process is not None and not session.stop.is_set():
-                    session.row.set_subtitle(GLib.markup_escape_text(f"Running · {service.detail}"))
-                    session.network.set_text("Check the exit IP for this route.")
+            message = f"Active route changed to {service.route}."
+            service.log.append("Network", message)
+            if service.pending is None:
+                self._refresh_running_programs(service, message)
         self._refresh_service()
         return GLib.SOURCE_REMOVE
+
+    def _refresh_running_programs(self, service, message):
+        for session in self.sessions.values():
+            if session.process is not None and not session.stop.is_set():
+                session.log.append("Network", message)
+                self._update_program_network(session, service)
+
+    @staticmethod
+    def _update_program_network(session, service):
+        if service.active:
+            session.row.set_subtitle(GLib.markup_escape_text(f"Running · {service.detail}"))
+            session.network.set_text("Check the exit IP for this route.")
+        else:
+            session.row.set_subtitle("Running · Network offline")
+            session.network.set_text("Start Session to reconnect this program.")
 
     def _refresh_service(self):
         state = self.launch_button.get_child()
         service = self.service
-        if service is not None:
+        active = bool(service and service.active)
+        pending = service.pending if service is not None else None
+        selecting = service is not None and service.selecting_direct is not None
+        if active:
             self.launch_button.add_css_class("active-session")
         else:
             self.launch_button.remove_css_class("active-session")
-        if self.stopping_service:
+        if self.closing or pending == "stop":
             state.set_label("Stopping…")
             state.set_icon_name("process-stop-symbolic")
-            self.service_status.set_text("Closing private tunnel…")
-        elif service is not None:
+            self.service_status.set_text("Stopping private network…")
+        elif pending == "start":
+            state.set_label("Starting…")
+            state.set_icon_name("media-playback-start-symbolic")
+            self.service_status.set_text("Starting private network…")
+        elif active:
             state.set_label("Stop Session")
             state.set_icon_name("process-stop-symbolic")
-            if service.tunnel is None:
-                self.service_status.set_text("Starting private tunnel…")
-            elif service.selecting_direct is not None:
-                self.service_status.set_text("Switching route…")
-            else:
-                self.service_status.set_text(f"Running · {service.route}")
+            self.service_status.set_text("Switching route…" if selecting else f"Running · {service.route}")
         else:
             state.set_label("Start Session")
             state.set_icon_name("media-playback-start-symbolic")
-            self.service_status.set_text("Session stopped")
-        self.launch_button.set_sensitive(not self.stopping_service)
-        ready = bool(service and service.tunnel and not service.stop.is_set() and service.selecting_direct is None)
-        self.use_proxy.set_sensitive(service is None or (ready and not any(
-            session.checking for session in self.sessions.values()
+            self.service_status.set_text("Network stopped · programs offline" if self.sessions else "Network stopped")
+        self.launch_button.set_sensitive(not (self.closing or pending or selecting))
+        ready = bool(service and service.ready and not self.closing)
+        editable = not (active or pending or self.closing)
+        self.use_proxy.set_sensitive(editable or (ready and not any(
+            session.check_stop is not None for session in self.sessions.values()
         )))
         for widget in (self.proxy, self.username, self.password, self.bookmark_menu):
-            widget.set_sensitive(service is None)
+            widget.set_sensitive(editable)
         if self.page == "B":
-            self.use_export.set_sensitive(service is None)
+            self.use_export.set_sensitive(editable)
         for session in self.sessions.values():
-            session.check_button.set_sensitive(bool(ready and session.process is not None and not session.checking
+            session.check_button.set_sensitive(bool(ready and session.process is not None and session.check_stop is None
                                                      and not session.stop.is_set()))
         self._update_protocol_plan(self.report if self.report is not None else Report())
         export_running = any(item.exports_vpn and item.session_id is not None for item in self.programs)
         for item in self.programs:
-            active = self.sessions.get(item.session_id)
+            running = self.sessions.get(item.session_id)
             content = item.play.get_child()
-            content.set_label("Stop" if active else "Run")
-            content.set_icon_name("process-stop-symbolic" if active else "media-playback-start-symbolic")
-            item.play.set_tooltip_text(f"{'Stop' if active else 'Run'} {item.name}")
-            item.play.set_sensitive(not active.stop.is_set() if active else ready and
+            content.set_label("Stop" if running else "Run")
+            content.set_icon_name("process-stop-symbolic" if running else "media-playback-start-symbolic")
+            item.play.set_tooltip_text(f"{'Stop' if running else 'Run'} {item.name}")
+            item.play.set_sensitive(not running.stop.is_set() if running else ready and
                                     (not item.exports_vpn or not export_running))
-            detail = active.row.get_subtitle() if active else GLib.markup_escape_text(item.detail)
+            detail = running.row.get_subtitle() if running else GLib.markup_escape_text(item.detail)
             item.row.set_subtitle(detail)
             item.view_log.set_sensitive(item.last_log is not None)
 
@@ -1008,7 +1069,7 @@ class Window(Adw.ApplicationWindow):
         self.program_list.set_visible(bool(self.programs))
 
     def _command_dialog(self, *_):
-        running = bool(self.service and self.service.tunnel and not self.service.stop.is_set())
+        running = bool(self.service and self.service.ready)
         dialog = Adw.MessageDialog(transient_for=self, heading="Terminal command",
                                    body="Run a noninteractive shell command inside a private tunnel. "
                                         "Its output appears under Sessions when logging is enabled.")
@@ -1045,8 +1106,7 @@ class Window(Adw.ApplicationWindow):
 
     def _launch(self, item):
         service = self.service
-        if (self.closing or service is None or service.tunnel is None or service.stop.is_set()
-                or service.selecting_direct is not None or item.session_id is not None):
+        if self.closing or service is None or not service.ready or item.session_id is not None:
             return
         try:
             if not service.direct:
@@ -1065,7 +1125,6 @@ class Window(Adw.ApplicationWindow):
         item.session_id = session_id
         self.session_programs[session_id] = item
         session = self._create_session(session_id, name)
-        session.upstream = None if service.direct else service.proxy
         self.sessions[session_id] = session
         item.last_log = session.row
         self.session_list.prepend(session.row)
@@ -1179,28 +1238,26 @@ class Window(Adw.ApplicationWindow):
         if session and self.service is service and not session.stop.is_set():
             session.tunnel = service.tunnel
             session.process = process
-            session.upstream = None if service.direct else service.proxy
-            session.row.set_subtitle(GLib.markup_escape_text(f"Running · {service.detail}"))
             session.row.add_css_class("session-active")
-            session.check_button.set_sensitive(service.selecting_direct is None)
-            session.network.set_text("Checks this session through Cloudflare HTTPS.")
+            self._update_program_network(session, service)
             self._refresh_service()
         return GLib.SOURCE_REMOVE
 
     def _check_session_exit(self, session_id):
         session = self.sessions.get(session_id)
         service = self.service
-        if (not session or not session.process or not service or service.selecting_direct is not None
-                or session.checking or session.stop.is_set()):
+        if (not session or not session.process or not service or not service.ready
+                or session.check_stop is not None or session.stop.is_set()):
             return
         tunnel, process = session.tunnel, session.process
-        session.checking = True
+        check_stop = threading.Event()
+        session.check_stop = check_stop
         session.check_button.set_sensitive(False)
         session.network.set_text("Checking exit IP…")
 
         def run():
             try:
-                result = tunnel.check_exit(stop=session.stop, process=process)
+                result = tunnel.check_exit(stop=check_stop, process=process)
                 location = result.get("loc")
                 address = f"{result['ip']} · {location}" if location else result["ip"]
                 detail = f"Exit IP: {address}"
@@ -1208,24 +1265,33 @@ class Window(Adw.ApplicationWindow):
                 return
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
                 detail = f"Exit IP check failed · {error}"
-            GLib.idle_add(self._show_session_exit, session_id, detail)
+            GLib.idle_add(self._show_session_exit, session_id, check_stop, detail)
 
         self._refresh_service()
         threading.Thread(target=run, daemon=True).start()
 
-    def _show_session_exit(self, session_id, detail):
+    def _show_session_exit(self, session_id, check_stop, detail):
         session = self.sessions.get(session_id)
-        if session and not session.stop.is_set():
-            session.checking = False
+        if session and session.check_stop is check_stop and not session.stop.is_set():
+            session.check_stop = None
             session.network.set_text(detail)
             session.log.append("Network", detail)
-            session.check_button.set_sensitive(True)
             self._refresh_service()
         return False
+
+    def _cancel_exit_checks(self):
+        for session in self.sessions.values():
+            if session.check_stop is not None:
+                session.check_stop.set()
+                session.check_stop = None
+                session.network.set_text("Exit IP check cancelled.")
 
     def _stop_session(self, session_id):
         if session := self.sessions.get(session_id):
             session.stop.set()
+            if session.check_stop is not None:
+                session.check_stop.set()
+                session.check_stop = None
             session.button.set_sensitive(False)
             session.check_button.set_sensitive(False)
             session.row.set_subtitle("Stopping…")
@@ -1239,22 +1305,20 @@ class Window(Adw.ApplicationWindow):
         test = self.test_stop if self.test_target is not None and app.matches_vpn_output(self.test_target) else None
         if test is not None:
             self._cancel_test()
-        sessions = [session_id for session_id, session in self.sessions.items()
-                    if session.upstream is not None and app.matches_vpn_output(session.upstream)]
         service = self.service
         if (service is not None and service.proxy is not None and app.matches_vpn_output(service.proxy)
-                and (not service.direct or service.selecting_direct is False)):
+                and (service.active or service.pending) and (not service.direct or service.selecting_direct is False)):
             self._stop_service()
             if not self.closing:
-                self._toast("VPN Dock’s output ended. Stopping the dependent proxy service on B.")
-        else:
-            for session_id in sessions:
-                self._stop_session(session_id)
-        return sessions, test
+                self._toast("VPN Dock’s output ended. Programs on B will stay open offline.")
+            return service, test
+        return None, test
 
     def _finished(self, session_id, status, failed):
         if session := self.sessions.pop(session_id, None):
             session.stop.set()
+            if session.check_stop is not None:
+                session.check_stop.set()
             session.tunnel = None
             captured = session.log.is_enabled()
             session.log.set_enabled(False)
@@ -1263,7 +1327,7 @@ class Window(Adw.ApplicationWindow):
             session.row.remove_css_class("session-active")
             session.log_label.set_text("Log")
             session.check_button.set_sensitive(False)
-            if session.checking or not session.network.get_text().startswith("Exit IP:"):
+            if session.check_stop is not None or not session.network.get_text().startswith("Exit IP:"):
                 session.network.set_text("This session has ended.")
             if failed:
                 session.row.add_css_class("session-failed")
@@ -1284,8 +1348,6 @@ class Window(Adw.ApplicationWindow):
             self._update_session_count()
         if item := self.session_programs.pop(session_id, None):
             item.session_id = None
-        if not self.sessions and self.service is None:
-            self.stopping_service = False
         self._refresh_service()
         self._complete_close()
         return False
@@ -1458,7 +1520,12 @@ class Window(Adw.ApplicationWindow):
     def _begin_close(self):
         self.closing = True
         self._cancel_test()
-        self._stop_service()
+        if self.service is not None:
+            self.service.stop.set()
+            self.service.commands.put(("quit", None))
+        for session_id in self.sessions:
+            self._stop_session(session_id)
+        self._refresh_service()
         self.set_sensitive(False)
         self._complete_close()
 
@@ -1478,6 +1545,7 @@ class Application(Adw.Application):
         self.pages = {}
         self.active_page = "A"
         self.closing = False
+        self.background = False
         self.close_dialog = None
         self.vpn_export = None
         self.vpn_address = VPN_PROXY_ADDRESS
@@ -1487,7 +1555,7 @@ class Application(Adw.Application):
         logging_action = Gio.SimpleAction.new_stateful("session-logging", None, GLib.Variant.new_boolean(True))
         logging_action.connect("change-state", self._change_session_logging)
         self.add_action(logging_action)
-        for name, callback in (("requirements", self.requirements), ("about", self.about)):
+        for name, callback in (("requirements", self.requirements), ("about", self.about), ("quit", self._quit_action)):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", callback)
             self.add_action(action)
@@ -1503,6 +1571,9 @@ class Application(Adw.Application):
         window.present()
         if previous is not None and previous is not window:
             previous.set_visible(False)
+        if self.background:
+            self.background = False
+            self.release()
 
     def _sync_presets(self, presets):
         for window in self.get_windows():
@@ -1571,12 +1642,13 @@ class Application(Adw.Application):
         self._export_draining = True
         self.vpn_ready = False
         consumer = self.pages.get("B")
-        sessions, test = consumer._stop_consuming_vpn_output() if consumer else ([], None)
+        service, test = consumer._stop_consuming_vpn_output() if consumer else (None, None)
         self._notify_vpn_output()
 
         def finish():
-            if consumer is not None and (any(session_id in consumer.sessions for session_id in sessions)
-                                         or (test is not None and consumer.test_stop is test)):
+            service_using_output = (service is not None and consumer.service is service
+                                    and (service.active or service.pending))
+            if consumer is not None and (service_using_output or (test is not None and consumer.test_stop is test)):
                 return GLib.SOURCE_CONTINUE
             previous = self.vpn_address
             self.vpn_export = None
@@ -1611,21 +1683,33 @@ class Application(Adw.Application):
         for termination_signal in (signal.SIGTERM, signal.SIGINT):
             GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, termination_signal, self._shutdown_requested)
 
-    def _request_close(self, requester):
+    def _quit_action(self, *_):
+        if window := self.pages.get(self.active_page):
+            self._request_close(window, quit_application=True)
+
+    def _request_close(self, requester, *, quit_application=False):
         if self.closing:
             return True
-        if not any(window.service or window.sessions or window.test_stop for window in self.pages.values()):
+        programs_running = any(window.sessions for window in self.pages.values())
+        work_in_progress = any(window.test_stop or (window.service and (window.service.active or window.service.pending))
+                               for window in self.pages.values())
+        if not (programs_running or work_in_progress):
             self._shutdown_requested()
             return True
         if self.close_dialog:
             self.close_dialog.present()
             return True
-        dialog = Adw.MessageDialog(
-            transient_for=requester, heading="Close isolated sessions?",
-            body="Closing Tundock stops the programs and tests on both pages.",
-        )
+        can_background = (not quit_application and programs_running
+                          and not self.get_flags() & Gio.ApplicationFlags.NON_UNIQUE)
+        body = "Quit Tundock to close the programs and stop the private networks on both pages."
+        if can_background:
+            body += " You can also keep the programs running in the background and open Tundock again to manage them."
+        dialog = Adw.MessageDialog(transient_for=requester, heading="Close Tundock?", body=body)
         dialog.add_response("cancel", "Keep open")
-        dialog.add_response("stop", "Stop and close")
+        if can_background:
+            dialog.add_response("background", "Keep running")
+            dialog.set_response_appearance("background", Adw.ResponseAppearance.SUGGESTED)
+        dialog.add_response("stop", "Stop and quit")
         dialog.set_response_appearance("stop", Adw.ResponseAppearance.DESTRUCTIVE)
         dialog.set_default_response("cancel")
         dialog.set_close_response("cancel")
@@ -1634,15 +1718,27 @@ class Application(Adw.Application):
             self.close_dialog = None
             if response == "stop":
                 self._shutdown_requested()
+            elif response == "background":
+                self._hide_windows()
 
         self.close_dialog = dialog
         dialog.connect("response", respond)
         dialog.present()
         return True
 
+    def _hide_windows(self):
+        if not self.background:
+            self.hold()
+            self.background = True
+        for window in self.pages.values():
+            window.set_visible(False)
+
     def _page_finished(self, window):
         if self.pages.get(window.page) is window:
             del self.pages[window.page]
+        if self.background and not self.pages:
+            self.background = False
+            self.release()
 
     def _shutdown_requested(self):
         if self.closing:

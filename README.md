@@ -7,13 +7,17 @@ Tundock is a native Linux desktop app for running a selected program and its chi
 Open the executable for your architecture from your file manager or run it in a terminal. If the file manager removed the executable permission on download, mark it executable in Properties or use:
 
 ```sh
-chmod +x Tundock-1.3.0-linux-x86_64
-./Tundock-1.3.0-linux-x86_64
+chmod +x Tundock-1.4.0-linux-x86_64
+./Tundock-1.4.0-linux-x86_64
 ```
 
 The bundled-engine build contains Tundock and sing-box in one Linux ELF. It loads them into a private temporary directory and removes that directory when the app exits. It uses no application installer or FUSE. Tundock keeps saved presets and proxy bookmarks in `${XDG_CONFIG_HOME:-$HOME/.config}/tundock`.
 
-Enter a proxy and select **Test connection** to check connectivity and protocol support. Use **Installed apps**, **Browse**, or **Add to list** to prepare programs. **Start Session** creates the stage’s private namespace and TUN. The **Run** button on each row launches that item and its children into that network. **Stop Session** closes those processes and releases the tunnel. Use **Save preset** to keep a program and its settings across restarts.
+Enter a proxy and select **Test connection** to check connectivity and protocol support. Use **Installed apps**, **Browse**, or **Add to list** to prepare programs. **Start Session** creates the stage’s private namespace and TUN. The **Run** button on each row launches that item and its children into that network. **Stop Session** takes those programs offline and leaves their windows and processes running. The **Stop** button on a program’s row still closes that program. Use **Save preset** to keep a program and its settings across restarts.
+
+While the session is stopped, you can edit the proxy address and settings. **Start Session** reattaches the tunnel to the retained namespace so the apps can open fresh connections. Connections that were interrupted by Stop may need to reconnect. Tundock releases the namespace after the session is stopped and the last program exits.
+
+When closing the main window with programs running, **Keep running** hides Tundock. Open it again from the same launcher to manage those programs. **Stop and quit** closes the programs and ends Tundock. Independent instances started with `--new-instance` can keep their own windows open for management.
 
 ### Switch to direct access
 
@@ -66,7 +70,7 @@ The connection test sends HTTPS and, when supported, an NTP request to Cloudflar
 
 ## Isolation and compatibility
 
-- Each stage session gets a separate Linux network namespace with its own loopback and TUN. Programs enter it only when launched through Tundock. Losing the engine closes the session. When upstream mode is selected, a failed proxy keeps that mode and direct access requires an explicit switch.
+- Each stage gets a separate Linux network namespace with its own loopback and TUN. Programs enter it only when launched through Tundock. Stopping or losing the engine leaves its programs running with private loopback access. Their external connections stay offline until the tunnel starts again. When upstream mode is selected, direct access requires an explicit switch.
 - **Share desktop services** allows the program to use the desktop session bus for portals and sign-in. Some programs depend on those services. Work delegated to host applications and services runs outside the tunnel.
 - Close any copy of a single-instance program before launching it. A program may otherwise hand the request to an existing host process, for example via its own Unix socket. Sandboxed packages, helper daemons and programs that require elevated privileges may need their own integration.
 - Tundock is for running trusted applications with isolated IP routing. It shares your filesystem and display session with the program. It is not a security sandbox for software you don't trust.
@@ -82,12 +86,12 @@ TUNDOCK_SING_BOX=/path/to/sing-box /usr/bin/python3 tests/integration.py
   --engine /path/to/sing-box \
   --engine-license /path/to/sing-box-notices.txt \
   --engine-source https://github.com/SagerNet/sing-box/tree/v1.14.4 \
-  /tmp/Tundock-1.3.0-linux-x86_64
+  /tmp/Tundock-1.4.0-linux-x86_64
 ```
 
 Use the exact license notices and source location for the binary you bundle. `--portable-notices` displays the bundled notice and source reference. The builder writes a companion SHA-256 file. `./packaging/make-release.sh /tmp` produces a source archive.
 
-The integration test uses local echo services and an isolated proxy to exercise TCP, UDP, IPv6, loopback, HTTP CONNECT, and engine loss. See the [0.2 audit and release brief](docs/upgrade-0.2.md). The bundled executable is a local release candidate. Before public distribution, select Tundock's license and verify the corresponding-source arrangements for the bundled engine.
+The integration test uses local echo services and isolated proxies to exercise TCP, UDP, IPv6, loopback, HTTP CONNECT, engine loss, and reattaching running apps to a different upstream in the same namespace. See the [0.2 audit and release brief](docs/upgrade-0.2.md). The bundled executable is a local release candidate. Before public distribution, select Tundock's license and verify the corresponding-source arrangements for the bundled engine.
 
 ## راهنمای سریع
 
